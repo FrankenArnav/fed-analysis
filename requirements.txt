@@ -6,3 +6,4 @@ plotly
 openpyxl
 python-dotenv
 tqdm
+comtradeapicall
