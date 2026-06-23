@@ -24,15 +24,6 @@ try:
 except ImportError:
     PLOTLY_OK = False
 
-# Selenium Imports
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
 # Optional dotenv for Comtrade
 try:
     from dotenv import load_dotenv
@@ -967,89 +958,195 @@ def run_asi_app():
         st.info("💡 To initialize the Custom Studio, please load your component blocks via the ingestion panel above.")
 
 def run_downloader_app():
-    st.title("Screener Mass-Download Interface")
-    DOWNLOAD_DIR = os.path.join(os.getcwd(), "screener_exports")
-    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
+    st.title("📥 Screener Mass-Downloader (Local Edition)")
+    
+    st.warning("⚠️ **Local Execution Required:** Screener.in requires a manual login and CAPTCHA verification that cannot be bypassed via a cloud-hosted dashboard. To extract this data, you need to run the downloader script locally on your machine.")
 
-    def setup_driver():
-        chrome_options = Options()
-        prefs = {"download.default_directory": DOWNLOAD_DIR, "download.prompt_for_download": False, "download.directory_upgrade": True, "safebrowsing.enabled": True}
-        chrome_options.add_experimental_option("prefs", prefs)
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"})
-        return driver
+    st.markdown("### 🛠️ Step 1: Download the Extractor Script")
+    st.markdown("Click the button below to download the standalone Python script designed to automate your browser safely.")
 
-    st.markdown("Enter the tickers you want to download. The tool will open a browser, wait for you to log in, and then systematically extract the Excel data sheets.")
-    default_tickers = "RELIANCE, TCS, INFY, HDFCBANK, ITC"
-    tickers_input = st.text_area("Target Tickers (comma-separated):", value=default_tickers)
+    # Content of app_downloader.py stored as a string
+    downloader_code = '''import streamlit as st
+import time
+import random
+import os
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
-    if st.button("Launch Extraction Sequence", type="primary"):
-        raw_tickers = tickers_input.split(',')
-        target_tickers = [t.strip().upper() for t in raw_tickers if t.strip()]
+st.set_page_config(page_title="Screener Downloader UI", layout="centered")
+st.title("Screener Mass-Download Interface")
+
+# --- Configuration ---
+DOWNLOAD_DIR = os.path.join(os.getcwd(), "screener_exports")
+if not os.path.exists(DOWNLOAD_DIR):
+    os.makedirs(DOWNLOAD_DIR)
+
+def setup_driver():
+    """Configures Chrome for local automation and direct downloading."""
+    chrome_options = Options()
+    
+    prefs = {
+        "download.default_directory": DOWNLOAD_DIR,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+    
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    
+    driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+        'source': "Object.defineProperty(navigator, 'webdriver', { get: () => undefined })"
+    })
+    
+    return driver
+
+# --- User Interface ---
+
+st.markdown("Enter the tickers you want to download. The tool will open a browser, wait for you to log in, and then systematically extract the Excel data sheets.")
+
+# Ticker Input Area
+default_tickers = "RELIANCE, TCS, INFY, HDFCBANK, ITC"
+tickers_input = st.text_area("Target Tickers (comma-separated):", value=default_tickers)
+
+# Extraction Controls
+if st.button("Launch Extraction Sequence", type="primary"):
+    
+    # Clean the input list
+    raw_tickers = tickers_input.split(',')
+    target_tickers = [t.strip().upper() for t in raw_tickers if t.strip()]
+    
+    if not target_tickers:
+        st.error("Please enter at least one ticker.")
+    else:
+        st.info(f"Initialized sequence for {len(target_tickers)} companies. Launching browser...")
         
-        if not target_tickers:
-            st.error("Please enter at least one ticker.")
-        else:
-            st.info(f"Initialized sequence for {len(target_tickers)} companies. Launching browser...")
-            try:
-                driver = setup_driver()
-                driver.get("https://www.screener.in/login/")
+        try:
+            driver = setup_driver()
+            
+            # 1. Auto-Detect Login Phase
+            driver.get("https://www.screener.in/login/")
+            
+            with st.status("Waiting for manual login...", expanded=True) as status:
+                st.write("1. A browser window has opened.")
+                st.write("2. Please log in to Screener and solve any captchas.")
+                st.write("3. The system is monitoring the URL and will proceed automatically once you reach the dashboard.")
                 
-                with st.status("Waiting for manual login...", expanded=True) as status:
-                    st.write("1. A browser window has opened.")
-                    st.write("2. Please log in to Screener and solve any captchas.")
-                    st.write("3. The system is monitoring the URL and will proceed automatically once you reach the dashboard.")
-                    logged_in = False
-                    for _ in range(180):
-                        current_url = driver.current_url
-                        if "login" not in current_url.lower():
-                            logged_in = True
-                            break
-                        time.sleep(1)
-                    if not logged_in:
-                        status.update(label="Login timed out.", state="error")
-                        st.stop()
-                    status.update(label="Authentication confirmed! Commencing downloads.", state="complete")
-
-                progress_bar = st.progress(0)
-                console = st.empty()
-                success_count = 0; failed_tickers = []
+                # Check the URL every second for up to 3 minutes
+                logged_in = False
+                for _ in range(180):
+                    current_url = driver.current_url
+                    if "login" not in current_url.lower():
+                        logged_in = True
+                        break
+                    time.sleep(1)
                 
-                for i, ticker in enumerate(target_tickers):
-                    console.info(f"Processing: {ticker} ({i+1}/{len(target_tickers)})")
-                    try:
-                        url = f"https://www.screener.in/company/{ticker}/consolidated/"
-                        driver.get(url)
-                        time.sleep(random.uniform(2.5, 4.0))
-                        xpath = "//form[contains(@action, '/excel/')]//button | //button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'export to excel')]"
-                        export_btn = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, xpath)))
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", export_btn)
-                        time.sleep(1.5)
-                        driver.execute_script("arguments[0].click();", export_btn)
-                        success_count += 1
-                        delay = random.uniform(8.0, 15.0)
-                        console.warning(f"Successfully triggered {ticker}. Mimicking human delay for {delay:.1f}s...")
-                        time.sleep(delay)
-                    except Exception as e:
-                        console.error(f"Failed to extract {ticker}. Skipping.")
-                        failed_tickers.append(ticker)
-                        time.sleep(5)
-                    progress_bar.progress((i + 1) / len(target_tickers))
+                if not logged_in:
+                    status.update(label="Login timed out.", state="error")
+                    st.stop()
                     
+                status.update(label="Authentication confirmed! Commencing downloads.", state="complete")
+
+            # 2. Automated Download Loop
+            progress_bar = st.progress(0)
+            console = st.empty()
+            
+            success_count = 0
+            failed_tickers = []
+            
+            for i, ticker in enumerate(target_tickers):
+                console.info(f"Processing: {ticker} ({i+1}/{len(target_tickers)})")
+                
+                try:
+                    url = f"https://www.screener.in/company/{ticker}/consolidated/"
+                    driver.get(url)
+                    time.sleep(random.uniform(2.5, 4.0))
+                    
+                    # Target and click the Export button via JS bypass
+                    xpath = "//form[contains(@action, '/excel/')]//button | //button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'export to excel')]"
+                    
+                    export_btn = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located((By.XPATH, xpath))
+                    )
+                    
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", export_btn)
+                    time.sleep(1.5)
+                    driver.execute_script("arguments[0].click();", export_btn)
+                    
+                    success_count += 1
+                    
+                    # Mandatory Anti-Ban Delay
+                    delay = random.uniform(8.0, 15.0)
+                    console.warning(f"Successfully triggered {ticker}. Mimicking human delay for {delay:.1f}s...")
+                    time.sleep(delay)
+                    
+                except Exception as e:
+                    console.error(f"Failed to extract {ticker}. Skipping.")
+                    failed_tickers.append(ticker)
+                    time.sleep(5)
+                
+                # Update visual progress
+                progress_bar.progress((i + 1) / len(target_tickers))
+                
+            driver.quit()
+            
+            # 3. Post-Run Summary
+            st.success(f"Extraction Complete! Successfully downloaded {success_count} files.")
+            st.markdown(f"**Files saved to:** `{DOWNLOAD_DIR}`")
+            
+            if failed_tickers:
+                st.error(f"Failed to process the following tickers: {', '.join(failed_tickers)}")
+                st.markdown("Ensure these tickers exist exactly as spelled on Screener.in.")
+                
+        except Exception as e:
+            st.error(f"A critical error occurred: {e}")
+            try:
                 driver.quit()
-                st.success(f"Extraction Complete! Successfully downloaded {success_count} files.")
-                st.markdown(f"**Files saved to:** `{DOWNLOAD_DIR}`")
-                if failed_tickers:
-                    st.error(f"Failed to process the following tickers: {', '.join(failed_tickers)}")
-                    st.markdown("Ensure these tickers exist exactly as spelled on Screener.in.")
-            except Exception as e:
-                st.error(f"A critical error occurred: {e}")
-                try: driver.quit()
-                except: pass
+            except:
+                pass
+'''
+
+    # Serve the file for download
+    st.download_button(
+        label="⬇️ Download `app_downloader.py`",
+        data=downloader_code,
+        file_name="app_downloader.py",
+        mime="text/x-python",
+        type="primary"
+    )
+
+    st.markdown("---")
+    st.markdown("### ⚙️ Step 2: Local Installation & Execution Guide")
+    st.markdown("""
+    To run this script on your local machine, open your terminal (or command prompt) and follow these simple steps:
+
+    **1. Install Required Libraries:** Ensure you have Python installed, then install the required packages:
+    ```bash
+    pip install streamlit selenium webdriver-manager
+    ```
+
+    **2. Navigate to your Download Folder:** Change your directory to where you saved the downloaded file.
+    ```bash
+    cd path/to/your/download/folder
+    ```
+
+    **3. Run the App Locally:** Start the Streamlit application on your machine:
+    ```bash
+    streamlit run app_downloader.py
+    ```
+
+    **4. Extract the Data:** The local app will open in your browser. Enter your target tickers and click launch. A new automated Chrome window will open. **Log in manually and solve the CAPTCHA.** The script will automatically detect when you reach the dashboard and will begin mass-downloading the Excel sheets to a `screener_exports` folder in your directory.
+    """)
 
 def run_financial_app():
     st.title("Financial Analyzer")
