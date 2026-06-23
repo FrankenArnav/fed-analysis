@@ -1723,7 +1723,7 @@ def run_comtrade_app():
             output_files_found = False
 
             for filename in os.listdir(COMTRADE_EXPORTS_DIR):
-                if filename.endswith((".xlsx", ".csv")):
+                if filename.endswith((".xlsx", ".csv", ".log")):
                     filepath = os.path.join(COMTRADE_EXPORTS_DIR, filename)
                     if os.path.getmtime(filepath) >= st.session_state.run_timestamp:
                         if filepath != st.session_state.config_file_path:
