@@ -46,23 +46,6 @@ from tqdm import tqdm
 
 import comtradeapicall
 
-# In-memory cache for the session
-_COUNTRY_MAP = {}
-
-def get_country_mapping():
-    """Fetches and caches the official Comtrade reporter mapping."""
-    global _COUNTRY_MAP
-    if not _COUNTRY_MAP:
-        try:
-            # Returns a list of dicts: [{'id': 842, 'text': 'USA'}, ...]
-            refs = comtradeapicall.getReference('reporter')
-            # Create a mapping of "Country Name" -> integer ID
-            _COUNTRY_MAP = {str(item['text']): int(item['id']) for item in refs if item['id'] != 'all'}
-        except Exception as e:
-            log.error(f"Failed to fetch country references: {e}")
-            return {}
-    return _COUNTRY_MAP
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AUTO-LOAD .env FILE
 # Looks for .env in the same folder as this script.
@@ -473,95 +456,6 @@ def fetch_flow(config, flow_cfg, hs_codes, period, is_test, mode_label):
     if failed:
         log.warning(f"  HS codes with no data/errors: {failed}")
     return combined, failed
-
-def fetch_bilateral(config, reporter_name, partner_name, flow_code, hs_codes, period):
-    api_key = os.environ.get(config["api_key_var"], "")
-    cmap = get_country_mapping()
-    
-    reporter_code = cmap.get(reporter_name)
-    partner_code = cmap.get(partner_name)
-    
-    if not reporter_code or not partner_code:
-        log.error("Invalid country names provided for bilateral fetch.")
-        return pd.DataFrame()
-
-    log.info(f"Bilateral Fetch: {reporter_name} to {partner_name} | Flow: {flow_code} | Period: {period}")
-    
-    results = []
-    for code in tqdm(hs_codes, desc=f"Bilateral {reporter_name}-{partner_name}"):
-        try:
-            # Reusing getFinalData, but with strict partner codes
-            mydf = comtradeapicall.getFinalData(
-                api_key, typeCode="C", freqCode="A", clCode="HS", period=period,
-                reporterCode=reporter_code, cmdCode=code, flowCode=flow_code,
-                partnerCode=partner_code, partner2Code=None, customsCode=None,
-                motCode=None, maxRecords=None, format_output="JSON", aggregateBy=None,
-                breakdownMode="classic", countOnly=None, includeDesc=True
-            )
-            if mydf is not None and not mydf.empty:
-                results.append(mydf)
-        except Exception as e:
-            emsg = traceback.format_exc().strip().split("\n")[-1]
-            record_error("bilateral", flow_code, code, period, "APIError", emsg, "Skipped")
-            
-        time.sleep(0.5) # Respect rate limits
-        
-    if not results:
-        return pd.DataFrame()
-
-    df = pd.concat(results, ignore_index=True)
-    
-    # 1. Clean and Calculate Unit Price (Reusing your logic)
-    trade_usd = pd.to_numeric(df.get("primaryValue"), errors="coerce")
-    qty_raw = pd.to_numeric(df.get("qty"), errors="coerce")
-    qty_valid = qty_raw.where(qty_raw > 0)
-    
-    clean_df = pd.DataFrame({
-        "Year": pd.to_numeric(df.get("period"), errors="coerce"),
-        "Reporter": reporter_name,
-        "Partner": partner_name,
-        "Flow": "Export" if flow_code == "X" else "Import",
-        "HS Code": df.get("cmdCode").astype(str).str.zfill(2),
-        "HS Description": df.get("cmdDesc"),
-        "Trade Value (USD)": trade_usd,
-        "Trade Value USD Mn": (trade_usd / 1_000_000).round(4),
-        "Quantity": qty_valid,
-        "Qty Unit": df.get("qtyUnitAbbr").astype(str).where(qty_valid.notna(), ""),
-        "Unit Price (USD)": (trade_usd / qty_valid).round(4)
-    })
-    
-    # 2. Append to Geography_Bilateral Sheet
-    _append_to_bilateral_sheet(config["cleaned_file"], clean_df)
-    
-    return clean_df
-
-def _append_to_bilateral_sheet(filepath, new_data):
-    """Appends to Geography_Bilateral, deduplicating existing records."""
-    sheet_name = "Geography_Bilateral"
-    if not os.path.exists(filepath):
-        return
-
-    try:
-        # Load existing data if sheet exists
-        existing_df = pd.DataFrame()
-        xls = pd.ExcelFile(filepath)
-        if sheet_name in xls.sheet_names:
-            existing_df = pd.read_excel(xls, sheet_name=sheet_name, dtype={"HS Code": str})
-        
-        # Combine and deduplicate
-        combined = pd.concat([existing_df, new_data], ignore_index=True)
-        combined.drop_duplicates(
-            subset=["Reporter", "Partner", "Flow", "HS Code", "Year"], 
-            keep="last", inplace=True
-        )
-        
-        # Save back to workbook
-        with pd.ExcelWriter(filepath, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-            combined.to_excel(writer, sheet_name=sheet_name, index=False)
-            
-    except Exception as e:
-        log.error(f"Failed to update Geography_Bilateral sheet: {e}")
-
 
 def run_fetch(config, is_test):
     """Run all configured flows and print a summary."""
