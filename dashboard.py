@@ -1759,6 +1759,10 @@ def run_comtrade_app():
         st.divider()
         st.header("🌍 Geography Drill-Down (Bilateral Trade)")
         st.markdown("Query specific country-to-country trade flows on demand. Results are automatically appended to your `Geography_Bilateral` Excel sheet.")
+
+        import sys
+        if COMTRADE_DIR not in sys.path:
+            sys.path.append(COMTRADE_DIR)
         
         # 1. Fetch Country List
         import sector_comtrade_pipeline as pipeline
