@@ -44,6 +44,25 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from tqdm import tqdm
 
+import comtradeapicall
+
+# In-memory cache for the session
+_COUNTRY_MAP = {}
+
+def get_country_mapping():
+    """Fetches and caches the official Comtrade reporter mapping."""
+    global _COUNTRY_MAP
+    if not _COUNTRY_MAP:
+        try:
+            # Returns a list of dicts: [{'id': 842, 'text': 'USA'}, ...]
+            refs = comtradeapicall.getReference('reporter')
+            # Create a mapping of "Country Name" -> integer ID
+            _COUNTRY_MAP = {str(item['text']): int(item['id']) for item in refs if item['id'] != 'all'}
+        except Exception as e:
+            log.error(f"Failed to fetch country references: {e}")
+            return {}
+    return _COUNTRY_MAP
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # AUTO-LOAD .env FILE
 # Looks for .env in the same folder as this script.
