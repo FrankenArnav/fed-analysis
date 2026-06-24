@@ -122,7 +122,6 @@ SUBPROCESS_ENV = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
 COMTRADE_DIR = os.path.join(os.getcwd(), "comtrade")
 COMTRADE_EXPORTS_DIR = os.path.join(COMTRADE_DIR, "exports")
 
-# Ensure the exports directory exists
 if not os.path.exists(COMTRADE_EXPORTS_DIR):
     os.makedirs(COMTRADE_EXPORTS_DIR)
 
@@ -229,13 +228,11 @@ def process_plfs_base_data(file_buffer, layout_specs, col_names):
     df['mult'] = pd.to_numeric(df['mult'], errors='coerce')
     df['final_wt'] = df['mult'] / 100.0
     
-    # Label Mappings
     df['state_label'] = df['state_raw'].map(PLFS_STATE_DICTIONARY).fillna(df['state_raw'])
     df['region_label'] = df['sector_raw'].map({'1': 'Rural', '2': 'Urban'}).fillna("Unknown")
     df['gender_label'] = df['sex'].map({'1': 'Male', '2': 'Female', '3': 'Third Gender'}).fillna("Unknown")
     df['worker_category'] = df['pas'].map(WORKER_CATEGORY_DICT).fillna("Unclassified/Other")
     
-    # Derived Variables
     if 'marital_raw' in df.columns:
         df['marital_status'] = df['marital_raw'].map(MARITAL_STATUS_DICT).fillna("Unclassified")
     if 'edu_raw' in df.columns:
@@ -671,7 +668,7 @@ def run_asi_app():
             emp = total.merge(women, on="a1", how="left").merge(bonus, on="a1", how="left").merge(pf, on="a1", how="left").merge(welfare, on="a1", how="left")
         else:
             emp = pd.DataFrame(columns=["a1"])
-            if "a1" in df.columns: emp["a1"] = df["a1"].unique()
+            if "a1" in df.columns: emp["a1"] = emp["a1"].unique()
         
         for col in ["total_workers", "total_wages", "women_workers", "bonus", "pf", "welfare"]:
             if col in emp.columns: emp[col] = pd.to_numeric(emp[col], errors="coerce").fillna(0)
@@ -711,13 +708,32 @@ def run_asi_app():
         return df
 
     st.markdown("### 📥 Primary Data Ingestion")
-    c_up1, c_up2, c_up3 = st.columns(3)
-    file_a = c_up1.file_uploader("Upload Summary/Identification (Block A)", type=["csv"])
-    file_c = c_up2.file_uploader("Upload Fixed Capital (Block C)", type=["csv"])
-    file_e = c_up3.file_uploader("Upload Employment (Block E)", type=["csv"])
-
-    st.markdown("### ➕ Additional Data Ingestion (Optional)")
-    extra_files = st.file_uploader("Upload ANY Additional Blocks (B, D, F, G, H, I, J, etc) to extract more variables", type=["csv"], accept_multiple_files=True)
+    
+    use_custom_asi = st.checkbox("Upload custom ASI data files instead of using local defaults")
+    
+    file_a = None
+    file_c = None
+    file_e = None
+    extra_files = None
+    
+    if use_custom_asi:
+        c_up1, c_up2, c_up3 = st.columns(3)
+        file_a = c_up1.file_uploader("Upload Summary/Identification (Block A)", type=["csv"])
+        file_c = c_up2.file_uploader("Upload Fixed Capital (Block C)", type=["csv"])
+        file_e = c_up3.file_uploader("Upload Employment (Block E)", type=["csv"])
+        extra_files = st.file_uploader("Upload ANY Additional Blocks (B, D, F, G, H, I, J, etc) to extract more variables", type=["csv"], accept_multiple_files=True)
+    else:
+        default_a = os.path.join("data", "Block_A.csv")
+        default_c = os.path.join("data", "Block_C.csv")
+        default_e = os.path.join("data", "Block_E.csv")
+        
+        if os.path.exists(default_a) and os.path.exists(default_c) and os.path.exists(default_e):
+            file_a = default_a
+            file_c = default_c
+            file_e = default_e
+            st.success("✅ Automatically loaded local ASI default files from the `data/` directory.")
+        else:
+            st.info("💡 Default ASI files (`Block_A.csv`, `Block_C.csv`, `Block_E.csv`) were not found in the `data/` directory. Please upload them manually by checking the box above.")
 
     if file_a and file_c and file_e:
         if not nic_codes_list:
@@ -954,19 +970,21 @@ def run_asi_app():
                         )
                 else:
                     st.warning(f"⚠️ No dataset records matched your selected NIC configuration entry values.")
-    else:
-        st.info("💡 To initialize the Custom Studio, please load your component blocks via the ingestion panel above.")
 
 def run_downloader_app():
-    st.title("📥 Screener Mass-Downloader (Local Edition)")
+    st.title("📥 Screener Mass-Downloader (Local Tool)")
     
-    st.warning("⚠️ **Local Execution Required:** Screener.in requires a manual login and CAPTCHA verification that cannot be bypassed via a cloud-hosted dashboard. To extract this data, you need to run the downloader script locally on your machine.")
-
-    st.markdown("### 🛠️ Step 1: Download the Extractor Script")
-    st.markdown("Click the button below to download the standalone Python script designed to automate your browser safely.")
-
-    # Content of app_downloader.py stored as a string
-    downloader_code = '''import streamlit as st
+    st.markdown("""
+    ### Why run locally?
+    Cloud servers do not have screens, which means automated scripts cannot prompt you to manually log in and solve CAPTCHAs. To securely access your Screener.in account and download files directly to your machine, this tool must be run locally.
+    
+    ### 🛠️ Setup Instructions
+    
+    **1. Download the App Script**
+    Click the button below to download the dedicated Python file.
+    """)
+    
+    downloader_script = '''import streamlit as st
 import time
 import random
 import os
@@ -1113,39 +1131,30 @@ if st.button("Launch Extraction Sequence", type="primary"):
             try:
                 driver.quit()
             except:
-                pass
-'''
-
-    # Serve the file for download
+                pass'''
+    
     st.download_button(
-        label="⬇️ Download `app_downloader.py`",
-        data=downloader_code,
+        label="Download `app_downloader.py`",
+        data=downloader_script,
         file_name="app_downloader.py",
-        mime="text/x-python",
-        type="primary"
+        mime="text/x-python"
     )
-
-    st.markdown("---")
-    st.markdown("### ⚙️ Step 2: Local Installation & Execution Guide")
+    
     st.markdown("""
-    To run this script on your local machine, open your terminal (or command prompt) and follow these simple steps:
-
-    **1. Install Required Libraries:** Ensure you have Python installed, then install the required packages:
+    **2. Install Dependencies**
+    
+    Open your terminal or command prompt and install the required libraries:
     ```bash
     pip install streamlit selenium webdriver-manager
     ```
-
-    **2. Navigate to your Download Folder:** Change your directory to where you saved the downloaded file.
-    ```bash
-    cd path/to/your/download/folder
-    ```
-
-    **3. Run the App Locally:** Start the Streamlit application on your machine:
+    
+    **3. Run the App**
+    
+    Navigate to the folder where you saved the script and run:
     ```bash
     streamlit run app_downloader.py
     ```
-
-    **4. Extract the Data:** The local app will open in your browser. Enter your target tickers and click launch. A new automated Chrome window will open. **Log in manually and solve the CAPTCHA.** The script will automatically detect when you reach the dashboard and will begin mass-downloading the Excel sheets to a `screener_exports` folder in your directory.
+    This will open the interface in your local browser, allowing you to seamlessly log in to Screener and automatically extract the requested financial sheets to your machine.
     """)
 
 def run_financial_app():
@@ -1323,7 +1332,20 @@ def run_plfs_app():
     primary_color = st.sidebar.color_picker("Primary Chart Color", value="#2B6CB0")
     secondary_color = st.sidebar.color_picker("Secondary Chart Color (Comparisons)", value="#D53F8C")
 
-    uploaded_file = st.file_uploader("Upload CPERV1.TXT Data File", type=['txt'])
+    st.markdown("### 📥 Primary Data Ingestion")
+    
+    use_custom_plfs = st.checkbox("Upload custom PLFS data file instead of using local default")
+    
+    uploaded_file = None
+    if use_custom_plfs:
+        uploaded_file = st.file_uploader("Upload CPERV1.TXT Data File", type=['txt'])
+    else:
+        default_plfs = os.path.join("data", "CPERV1.TXT")
+        if os.path.exists(default_plfs):
+            uploaded_file = default_plfs
+            st.success(f"✅ Automatically loaded local PLFS default file from the `data/` directory.")
+        else:
+            st.info(f"💡 Default PLFS file (`CPERV1.TXT`) was not found in the `data/` directory. Please upload it manually by checking the box above.")
 
     if uploaded_file is not None:
         with st.spinner('Parsing PLFS microdata framework and mapping structures...'):
