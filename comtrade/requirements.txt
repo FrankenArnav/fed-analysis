@@ -1,7 +1,0 @@
-streamlit
-plotly
-pandas
-openpyxl
-comtradeapicall
-tqdm
-python-dotenv
