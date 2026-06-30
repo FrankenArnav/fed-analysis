@@ -1577,6 +1577,7 @@ def run_asi_app():
         "semi_finished_opening": "Opening Stock: Semi-finished", "semi_finished_closing": "Closing Stock: Semi-finished",
         "finished_goods_opening": "Opening Stock: Finished Goods", "finished_goods_closing": "Closing Stock: Finished Goods",
         "total_employee_wages": "Total Employee Wages", "total_workers": "Total Workers", "women_workers": "Women Workers",
+        "total_persons_engaged": "Total Persons Engaged",
         "fixed_assets_net_closing": "Fixed Assets: Net Closing Value", "plant_machinery_gross_closing": "Plant & Machinery: Gross Closing Value",
         "actual_addition_fixed_assets": "Actual Addition to Fixed Assets", "working_capital": "Working Capital (Block D)",
         "total_inventory_closing": "Total Inventory (Closing)", "outstanding_loans": "Outstanding Loans (Block D)",
@@ -1707,9 +1708,13 @@ def run_asi_app():
                 
                 if e_id in df_E.columns:
                     e10 = df_E[df_E[e_id] == 10].groupby('dsl')[e_wages].first().rename('total_employee_wages')
+                    # Item 10 is Block E's "Total" row (all worker/employee/other-persons
+                    # categories combined), so its persons-worked column gives the headcount
+                    # equivalent — i.e. Total Persons Engaged — alongside its wages figure above.
+                    e10_pe = df_E[df_E[e_id] == 10].groupby('dsl')[e_workers].first().rename('total_persons_engaged')
                     e6_tot = df_E[df_E[e_id] == 6].groupby('dsl')[e_workers].first().rename('total_workers')
                     e2_wom = df_E[df_E[e_id] == 2].groupby('dsl')[e_workers].first().rename('women_workers')
-                    df_E_merged = pd.concat([e10, e6_tot, e2_wom], axis=1).reset_index()
+                    df_E_merged = pd.concat([e10, e10_pe, e6_tot, e2_wom], axis=1).reset_index()
                 else: df_E_merged = pd.DataFrame(columns=['dsl'])
 
                 # 5. Block F & G Processing
@@ -1794,7 +1799,7 @@ def run_asi_app():
                     'depreciation_annexure', 'nfcf_without_f7', 'materials_fuels_stores_closing',
                     'materials_fuels_stores_opening', 'semi_finished_closing', 'semi_finished_opening',
                     'finished_goods_closing', 'finished_goods_opening', 'total_employee_wages',
-                    'bonus', 'pf', 'welfare', 'total_workers', 'women_workers', 'costop', 'mult'
+                    'bonus', 'pf', 'welfare', 'total_workers', 'women_workers', 'total_persons_engaged', 'costop', 'mult'
                 ]
                 for c in required_cols:
                     if c not in merged.columns: merged[c] = 0
@@ -1908,13 +1913,15 @@ def run_asi_app():
                         w_em = pop_estimate(curr_df, "total_emoluments")
                         w_wom = pop_estimate(curr_df, "women_workers")
                         w_fixed = pop_estimate(curr_df, "pc_03_fixed_capital") 
+                        w_pe = pop_estimate(curr_df, "total_persons_engaged")
                         summary_rows.append({
                             "Group Segment": label, "Surveyed Plants": curr_df.shape[0], "Est Population Size": int(round(curr_df["mult"].sum())),
                             "Output per Worker (Lakh)": (w_op / w_wk / 1e5) if w_wk > 0 else 0,
                             "Emp per Crore Investment": (w_wk / (w_fixed / 1e7)) if w_fixed > 0 else 0,
                             "Labour Income (%)": (w_em / w_op * 100) if w_op > 0 else 0,
                             "Women Workforce Share (%)": (w_wom / w_wk * 100) if w_wk > 0 else 0,
-                            "Workforce Size (Mn)": w_wk / 1e6, "Capital Stock Asset (Cr)": w_fixed / 1e7
+                            "Workforce Size (Mn)": w_wk / 1e6, "Capital Stock Asset (Cr)": w_fixed / 1e7,
+                            "Persons Engaged (Mn)": w_pe / 1e6
                         })
                     summary_table_df = pd.DataFrame(summary_rows)
                     
@@ -1926,7 +1933,8 @@ def run_asi_app():
                     # ----------------------------------------------------
                     base_metrics = [
                         "Emp per Crore Investment", "Output per Worker (Lakh)", "Labour Income (%)", 
-                        "Women Workforce Share (%)", "Plant Density Count", "Total Segment Workforce"
+                        "Women Workforce Share (%)", "Plant Density Count", "Total Segment Workforce",
+                        "No. of Persons Engaged"
                     ]
                     
                     pc_options = []
@@ -1988,6 +1996,7 @@ def run_asi_app():
                             w_em = pop_estimate(grp, "total_emoluments")
                             w_wom = pop_estimate(grp, "women_workers")
                             w_fixed = pop_estimate(grp, "pc_03_fixed_capital")
+                            w_pe = pop_estimate(grp, "total_persons_engaged")
                             
                             is_tgt = False
                             if chart_dimension == "2-Digit NIC Division" and str(val_id) in [c[:2] for c in nic_codes_list]: is_tgt = True
@@ -1999,7 +2008,8 @@ def run_asi_app():
                                 "Output per Worker (Lakh)": (w_op / w_wk / 1e5) if w_wk > 0 else 0,
                                 "Labour Income (%)": (w_em / w_op * 100) if w_op > 0 else 0,
                                 "Women Workforce Share (%)": (w_wom / w_wk * 100) if w_wk > 0 else 0,
-                                "Plant Density Count": grp.shape[0], "Total Segment Workforce": w_wk
+                                "Plant Density Count": grp.shape[0], "Total Segment Workforce": w_wk,
+                                "No. of Persons Engaged": w_pe
                             }
                             
                             for ext_col in extra_metric_cols:
@@ -2036,18 +2046,21 @@ def run_asi_app():
                                 ax.set_ylabel(chart_metric, fontweight="bold")
 
                                 # Large raw values (e.g. workforce counts in the millions) printed in
-                                # full with .1f used to overflow/crowd the chart. Abbreviate to
-                                # K/M/B and give the axis extra headroom so the top label always
-                                # has room to sit above the tallest bar without getting clipped.
-                                def _fmt_compact(v):
-                                    av = abs(v)
-                                    if av >= 1e9: return f"{v / 1e9:.1f}B"
-                                    if av >= 1e6: return f"{v / 1e6:.1f}M"
-                                    if av >= 1e3: return f"{v / 1e3:.1f}K"
-                                    return f"{v:.1f}"
-
+                                # full with .1f used to overflow/crowd the chart. Pick ONE unit
+                                # (K/M/B) for the whole chart based on its largest bar, and use that
+                                # same unit on every label — instead of each bar choosing its own
+                                # unit, which made charts show a mix of e.g. "800K" and "1.2M".
                                 max_height = plot_df[chart_metric].max()
-                                if pd.notna(max_height) and max_height > 0:
+                                abs_max = abs(max_height) if pd.notna(max_height) else 0
+                                if abs_max >= 1e9: _divisor, _suffix = 1e9, "B"
+                                elif abs_max >= 1e6: _divisor, _suffix = 1e6, "M"
+                                elif abs_max >= 1e3: _divisor, _suffix = 1e3, "K"
+                                else: _divisor, _suffix = 1, ""
+
+                                def _fmt_compact(v):
+                                    return f"{v / _divisor:.1f}{_suffix}" if _divisor != 1 else f"{v:.1f}"
+
+                                if abs_max > 0:
                                     ax.set_ylim(top=max_height * 1.18)
                                     label_offset = max_height * 0.02
                                 else:
@@ -2095,13 +2108,14 @@ def run_asi_app():
                         st.dataframe(summary_table_df.style.format({
                             'Surveyed Plants': '{:,.0f}', 'Est Population Size': '{:,.0f}', 'Output per Worker (Lakh)': '{:.2f}L', 
                             'Emp per Crore Investment': '{:.1f}', 'Labour Income (%)': '{:.2f}%', 'Women Workforce Share (%)': '{:.2f}%',
-                            'Workforce Size (Mn)': '{:.3f} Mn', 'Capital Stock Asset (Cr)': '₹{:,.2f} Cr'
+                            'Workforce Size (Mn)': '{:.3f} Mn', 'Capital Stock Asset (Cr)': '₹{:,.2f} Cr', 'Persons Engaged (Mn)': '{:.3f} Mn'
                         }))
                     with tab_led2:
                         st.markdown(f"##### Normalized Custom Output Metrics Ledger (Grouped by {chart_dimension})")
                         style_dict = {
                             'Emp per Crore Investment': '{:.2f}', 'Output per Worker (Lakh)': '{:.2f}L', 'Labour Income (%)': '{:.2f}%', 
-                            'Women Workforce Share (%)': '{:.2f}%', 'Plant Density Count': '{:,.0f}', 'Total Segment Workforce': '{:,.0f}'
+                            'Women Workforce Share (%)': '{:.2f}%', 'Plant Density Count': '{:,.0f}', 'Total Segment Workforce': '{:,.0f}',
+                            'No. of Persons Engaged': '{:,.0f}'
                         }
                         st.dataframe(studio_plot_df.style.format(style_dict, na_rep="-"))
                     with tab_led3:
