@@ -1992,9 +1992,28 @@ def run_asi_app():
                                 ax.set_xticks(range(len(plot_df["label_name"])))
                                 ax.set_xticklabels([textwrap.fill(str(x), width=16) for x in plot_df["label_name"]], rotation=45, ha="right", fontsize=9)
                                 ax.set_ylabel(chart_metric, fontweight="bold")
+
+                                # Large raw values (e.g. workforce counts in the millions) printed in
+                                # full with .1f used to overflow/crowd the chart. Abbreviate to
+                                # K/M/B and give the axis extra headroom so the top label always
+                                # has room to sit above the tallest bar without getting clipped.
+                                def _fmt_compact(v):
+                                    av = abs(v)
+                                    if av >= 1e9: return f"{v / 1e9:.1f}B"
+                                    if av >= 1e6: return f"{v / 1e6:.1f}M"
+                                    if av >= 1e3: return f"{v / 1e3:.1f}K"
+                                    return f"{v:.1f}"
+
+                                max_height = plot_df[chart_metric].max()
+                                if pd.notna(max_height) and max_height > 0:
+                                    ax.set_ylim(top=max_height * 1.18)
+                                    label_offset = max_height * 0.02
+                                else:
+                                    label_offset = 0
                                 for bar in bars[:5]:
                                     height = bar.get_height()
-                                    ax.text(bar.get_x() + bar.get_width()/2., height + (height * 0.01), f'{height:.1f}', ha='center', va='bottom', fontsize=8)
+                                    ax.text(bar.get_x() + bar.get_width() / 2., height + label_offset,
+                                            _fmt_compact(height), ha='center', va='bottom', fontsize=8)
                             elif chart_type == "Line Chart":
                                 ax.plot(plot_df["label_name"], plot_df[chart_metric], marker='o', color=chart_palette, linewidth=2, markersize=8)
                                 ax.fill_between(plot_df["label_name"], plot_df[chart_metric], color=chart_palette, alpha=0.1)
