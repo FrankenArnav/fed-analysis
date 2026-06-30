@@ -15,6 +15,7 @@ import subprocess
 import re
 import sys
 from pathlib import Path
+import json
 
 # Plotly Imports
 try:
@@ -273,7 +274,7 @@ def locate_chart_data_workbook(config_path):
         override = get_config_field(config_path, "visual_settings", "Output chart data workbook name")
         slug = get_config_field(config_path, "sector_details", "Sector slug")
         if override:
-            candidates.append(override if os.path.isabs(override) else os.path.join(COMTRADE_EXPORTS_DIR, override))
+            candidates.append(os.path.join(COMTRADE_EXPORTS_DIR, override) if not os.path.isabs(override) else override)
         if slug:
             candidates.append(os.path.join(COMTRADE_EXPORTS_DIR, f"{slug}_context_graph_data.xlsx"))
     for c in candidates:
@@ -582,6 +583,850 @@ def show_interactive_visuals(chart_path, sector_name):
     with st.expander("View underlying data"):
         st.dataframe(plot_df, use_container_width=True)
 
+def render_geography_drilldown(config_file_path, cleaned_path, sector_name, api_key, palette=None):
+    palette = palette or PALETTE_PRESETS[DEFAULT_PALETTE]
+    st.subheader("🌍 Geography Drill-Down — Country-to-Country Trade")
+    st.caption("Look up trade between any two specific countries — e.g. “how much does China import from "
+               "the US” — or compare several partner countries' share of one country's trade in an item.")
+
+    if not PLOTLY_OK:
+        st.error("The `plotly` package is required for charts. Run `pip install plotly`, then restart the app.")
+        return
+
+    def _run_geo_fetch(cmd, spinner_text):
+        log_box = st.empty()
+        log_text = ""
+        with st.spinner(spinner_text):
+            try:
+                process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    env=SUBPROCESS_ENV, encoding="utf-8", errors="replace", cwd=COMTRADE_EXPORTS_DIR
+                )
+                for line in iter(process.stdout.readline, ''):
+                    log_text += line
+                    log_box.code(log_text[-2000:], language="text")
+                process.wait()
+                if process.returncode != 0:
+                    st.error("❌ Fetch failed. Check the log above.")
+                elif ("No bilateral data returned for this pair/flow/years" in log_text
+                      or "No data returned for any selected partner" in log_text):
+                    st.warning(
+                        "⚠️ Comtrade returned no data for this exact combination of country/countries, "
+                        "flow, HS code(s), and year range — nothing was added to the Geography_Bilateral "
+                        "sheet. This usually means the trade doesn't exist (or is too small to report) "
+                        "for this specific combination, not a fetch error. Try different countries, "
+                        "widen the year range, or check the flow direction (export vs. import)."
+                    )
+                else:
+                    st.success("✅ Saved to the Geography_Bilateral sheet in the cleaned workbook.")
+            except Exception as e:
+                st.error(f"An unexpected error occurred: {e}")
+
+    def _run_top_partners_fetch(cmd, spinner_text):
+        log_box = st.empty()
+        log_text = ""
+        with st.spinner(spinner_text):
+            try:
+                process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    env=SUBPROCESS_ENV, encoding="utf-8", errors="replace", cwd=COMTRADE_EXPORTS_DIR
+                )
+                for line in iter(process.stdout.readline, ''):
+                    log_text += line
+                    log_box.code(log_text[-2000:], language="text")
+                process.wait()
+                if process.returncode != 0:
+                    st.error("❌ Could not find top partners. Check the log above.")
+                elif "TOP PARTNERS COMPLETE" in log_text:
+                    st.success("✅ Top partners found — see the tables below.")
+                else:
+                    st.warning("⚠️ Comtrade returned no partner-breakdown data for this reporter/HS/year "
+                               "combination — try widening the HS codes or year range above.")
+            except Exception as e:
+                st.error(f"An unexpected error occurred: {e}")
+
+    @st.cache_data(ttl=86400, show_spinner="Loading country list (first time only)...")
+    def _country_ref():
+        if COMTRADE_DIR not in sys.path:
+            sys.path.insert(0, COMTRADE_DIR)
+        import sector_comtrade_pipeline as scp
+        original_cwd = os.getcwd()
+        os.chdir(COMTRADE_EXPORTS_DIR)
+        try:
+            ref = scp.get_country_reference()
+        finally:
+            os.chdir(original_cwd)
+        return ref
+
+    try:
+        ref = _country_ref()
+    except Exception as e:
+        st.warning(f"Could not load the country list (needs an internet connection the first time this "
+                   f"runs): {e}")
+        return
+
+    names = ref["name"].tolist()
+    name_to_code = dict(zip(ref["name"], ref["code"]))
+
+    def _default_name(preferred, fallback_idx):
+        for p in preferred:
+            if p in names:
+                return p
+        return names[fallback_idx] if names else ""
+
+    view_mode = st.radio("View", ["Single pair", "Compare multiple partners"],
+                         horizontal=True, key="geo_view_mode")
+
+    if "geo_reporter_country" not in st.session_state:
+        st.session_state["geo_reporter_country"] = _default_name(["India"], 0)
+    if "geo_partner_country" not in st.session_state:
+        st.session_state["geo_partner_country"] = _default_name(
+            ["United States of America", "USA", "China"], min(1, len(names) - 1))
+
+    def _swap_countries():
+        r = st.session_state["geo_reporter_country"]
+        p = st.session_state["geo_partner_country"]
+        st.session_state["geo_reporter_country"], st.session_state["geo_partner_country"] = p, r
+
+    partner_names = []
+    include_world = False
+    if view_mode == "Single pair":
+        c1, c2, c3 = st.columns([5, 1, 5])
+        with c1:
+            st.selectbox("Reporter country", names, key="geo_reporter_country")
+        with c2:
+            st.write("")
+            st.button("🔄", help="Swap reporter and partner", on_click=_swap_countries, key="geo_swap_btn")
+        with c3:
+            st.selectbox("Partner country", names, key="geo_partner_country")
+    else:
+        st.selectbox("Reporter country", names, key="geo_reporter_country")
+        default_partners = [n for n in [_default_name(["United States of America"], 0),
+                                        _default_name(["China"], 0)]
+                            if n and n != st.session_state["geo_reporter_country"]]
+        
+        if "geo_partners_pending" in st.session_state:
+            st.session_state["geo_partners_multi"] = st.session_state.pop("geo_partners_pending")
+        partner_names = st.multiselect(
+            "Partner countries to compare", names,
+            default=default_partners[:2], key="geo_partners_multi")
+        include_world = st.checkbox(
+            "Include World total (accurate % share + \"Rest of World\" slice — 1 extra fetch)",
+            value=True, key="geo_include_world")
+
+    reporter_name = st.session_state["geo_reporter_country"]
+    reporter_code = name_to_code.get(reporter_name)
+    if view_mode == "Single pair":
+        partner_name = st.session_state["geo_partner_country"]
+        partner_code = name_to_code.get(partner_name)
+
+    import datetime as _dt
+    _auto_latest = _dt.date.today().year - 1
+    try:
+        config_path_full = os.path.join(COMTRADE_EXPORTS_DIR, config_file_path) if not os.path.isabs(config_file_path) else config_file_path
+        dfy = pd.read_excel(config_path_full, "years", header=1)
+        dfy.columns = [str(c).strip() for c in dfy.columns]
+        cfg_start = int(float(dfy.iloc[0]["Start Year"]))
+        _ey = dfy.iloc[0].get("End Year", None)
+        cfg_end = (int(float(_ey)) if pd.notna(_ey) and str(_ey).strip().lower() not in ("", "auto", "latest", "nan")
+                  else _auto_latest)
+    except Exception:
+        cfg_start, cfg_end = _auto_latest - 10, _auto_latest
+    
+    slider_max = max(cfg_end, _auto_latest)
+
+    try:
+        config_path_full = os.path.join(COMTRADE_EXPORTS_DIR, config_file_path) if not os.path.isabs(config_file_path) else config_file_path
+        dfh = pd.read_excel(config_path_full, "hs_codes", header=1, dtype=str)
+        dfh.columns = [str(c).strip() for c in dfh.columns]
+        incl_col = next((c for c in dfh.columns if "include" in c.lower()), None)
+        sector_hs = (dfh[dfh[incl_col].str.strip().str.lower() == "include"]["HS Code"]
+                    .dropna().str.strip().tolist()) if incl_col else []
+    except Exception:
+        sector_hs = []
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        flow_choice = st.radio("Flow", ["Exports (Reporter → Partner)", "Imports (Reporter ← Partner)"],
+                               horizontal=True, key="geo_flow")
+        flow_code = "X" if flow_choice.startswith("Exports") else "M"
+    with cc2:
+        yr_range = st.slider("Year range", cfg_start, slider_max, (max(cfg_start, cfg_end - 9), cfg_end),
+                             key="geo_years")
+
+    hs_sel = st.multiselect(
+        f"HS codes to fetch (leave empty to use this sector's full list — {len(sector_hs)} codes)",
+        sector_hs, default=[], key="geo_hs_filter")
+    active_hs = [str(h).strip() for h in (hs_sel if hs_sel else sector_hs)]
+    if hs_sel:
+        st.caption(f"📊 Chart below will sum only the {len(active_hs)} HS code(s) selected above "
+                   f"({', '.join(active_hs[:8])}{'…' if len(active_hs) > 8 else ''}) — fetch this "
+                   f"exact combination first if you haven't already; the chart only shows rows "
+                   f"already saved for it, not rows from a previous broader fetch.")
+    else:
+        st.caption(f"📊 Chart below sums all {len(active_hs)} codes in this sector's full HS list.")
+
+    with st.expander("🔎 Find top partners (which countries should I compare?)", expanded=False):
+        st.caption("Adding partner countries above is mostly guesswork without this. Fetch the "
+                   f"{reporter_name or 'reporter'}'s full partner breakdown for the HS code(s)/years "
+                   "currently selected, and see its top trading partners ranked by trade value — "
+                   "both top export destinations and top import sources, in one click.")
+        tp_top_n = st.slider("How many top partners per direction", 5, 10, 10, key="geo_top_n")
+        tp_clicked = st.button("🔎 Find top partners", key="geo_top_partners_btn")
+
+        if tp_clicked:
+            if not reporter_code:
+                st.error("Pick a reporter country.")
+            elif not api_key:
+                st.error("API Key is required (set it in the field above, in Step 3).")
+            else:
+                os.environ["COMTRADE_API_KEY"] = api_key
+                tp_years = [str(y) for y in range(yr_range[0], yr_range[1] + 1)]
+                script_path = os.path.join(COMTRADE_DIR, "sector_comtrade_pipeline.py")
+                cmd = [sys.executable, script_path, "--config", config_file_path,
+                      "--mode", "top_partners", "--reporter", reporter_code, "--top-n", str(tp_top_n)]
+                if active_hs:
+                    cmd += ["--hs", ",".join(active_hs)]
+                if tp_years:
+                    cmd += ["--years", ",".join(tp_years)]
+                _run_top_partners_fetch(cmd, f"Finding {reporter_name}'s top trading partners...")
+
+        tp_slug = get_config_field(os.path.join(COMTRADE_EXPORTS_DIR, config_file_path) if not os.path.isabs(config_file_path) else config_file_path, "sector_details", "Sector slug")
+        tp_json_path = os.path.join(COMTRADE_EXPORTS_DIR, f"{tp_slug}_top_partners.json") if tp_slug else None
+        if tp_json_path and os.path.exists(tp_json_path):
+            try:
+                tp_data = json.loads(Path(tp_json_path).read_text(encoding="utf-8"))
+            except Exception:
+                tp_data = None
+            if tp_data and tp_data.get("reporter_code") == reporter_code:
+                st.caption(f"Last found for **{tp_data.get('reporter', '')}** — "
+                          f"{len(tp_data.get('hs_codes', []))} HS code(s), "
+                          f"{tp_data.get('year_start', '')}–{tp_data.get('year_end', '')} "
+                          f"(generated {tp_data.get('generated_at', '')})")
+                tcol1, tcol2 = st.columns(2)
+                for col, dkey, label in (
+                    (tcol1, "exports", f"Top export destinations for {tp_data.get('reporter', '')}"),
+                    (tcol2, "imports", f"Top import sources for {tp_data.get('reporter', '')}"),
+                ):
+                    with col:
+                        st.markdown(f"**{label}**")
+                        rows = tp_data.get(dkey, [])
+                        if not rows:
+                            st.caption("No data returned for this direction.")
+                            continue
+                        tdf = pd.DataFrame(rows)
+                        disp = tdf[["Rank", "Partner", "Trade Value (USD)", "Share %"]].copy()
+                        disp["Trade Value (USD)"] = disp["Trade Value (USD)"].map(lambda v: f"${v:,.0f}")
+                        disp["Share %"] = disp["Share %"].map(lambda v: f"{v:.2f}%")
+                        st.dataframe(disp, hide_index=True, use_container_width=True)
+                        add_names = [r["Partner"] for r in rows
+                                    if r["Partner"] in names and r["Partner"] != reporter_name]
+                        if add_names and view_mode == "Compare multiple partners":
+                            if st.button(f"➕ Add these {len(add_names)} to partner countries to compare",
+                                        key=f"geo_add_{dkey}"):
+                                current = list(st.session_state.get("geo_partners_multi", []))
+                                merged = current + [n for n in add_names if n not in current]
+                                st.session_state["geo_partners_pending"] = merged
+                                st.rerun()
+            elif tp_data:
+                st.caption("Top-partners results on file are for a different reporter country — "
+                          "click “Find top partners” above to refresh for the current selection.")
+
+    fetch_label = ("\U0001F4E1 Fetch bilateral trade data" if view_mode == "Single pair"
+                   else "\U0001F4E1 Fetch comparison data")
+    fetch_clicked = st.button(fetch_label, type="primary", key="geo_fetch_btn")
+
+    if fetch_clicked:
+        hs_arg    = active_hs
+        years_arg = [str(y) for y in range(yr_range[0], yr_range[1] + 1)]
+
+        if view_mode == "Single pair":
+            if not reporter_code or not partner_code:
+                st.error("Pick a reporter and partner country.")
+            elif reporter_code == partner_code:
+                st.error("Reporter and partner can't be the same country.")
+            elif not api_key:
+                st.error("API Key is required (set it in the field above, in Step 3).")
+            else:
+                os.environ["COMTRADE_API_KEY"] = api_key
+                script_path = os.path.join(COMTRADE_DIR, "sector_comtrade_pipeline.py")
+                cmd = [sys.executable, script_path, "--config", config_file_path,
+                      "--mode", "bilateral", "--reporter", reporter_code, "--partner", partner_code,
+                      "--flow", flow_code]
+                if hs_arg:
+                    cmd += ["--hs", ",".join(hs_arg)]
+                if years_arg:
+                    cmd += ["--years", ",".join(years_arg)]
+                _run_geo_fetch(cmd, f"Fetching {reporter_name} "
+                               f"{'exports to' if flow_code == 'X' else 'imports from'} {partner_name}...")
+        else:
+            if not reporter_code:
+                st.error("Pick a reporter country.")
+            elif not partner_names:
+                st.error("Pick at least one partner country to compare.")
+            elif reporter_name in partner_names:
+                st.error("Reporter can't also be one of the partners being compared.")
+            elif not api_key:
+                st.error("API Key is required (set it in the field above, in Step 3).")
+            else:
+                os.environ["COMTRADE_API_KEY"] = api_key
+                partner_codes = [name_to_code[n] for n in partner_names]
+                script_path = os.path.join(COMTRADE_DIR, "sector_comtrade_pipeline.py")
+                cmd = [sys.executable, script_path, "--config", config_file_path,
+                      "--mode", "bilateral_compare", "--reporter", reporter_code,
+                      "--partners", ",".join(partner_codes), "--flow", flow_code]
+                if hs_arg:
+                    cmd += ["--hs", ",".join(hs_arg)]
+                if years_arg:
+                    cmd += ["--years", ",".join(years_arg)]
+                if not include_world:
+                    cmd += ["--no-world-total"]
+                _run_geo_fetch(cmd, f"Fetching {reporter_name}'s trade with {len(partner_names)} partner(s)...")
+
+    geo_cleaned = cleaned_path or locate_cleaned_workbook(os.path.join(COMTRADE_EXPORTS_DIR, config_file_path) if not os.path.isabs(config_file_path) else config_file_path)
+    if not geo_cleaned or not os.path.exists(geo_cleaned):
+        st.info("Run a lookup above to create the Geography_Bilateral sheet.")
+        return
+    try:
+        xls = pd.ExcelFile(geo_cleaned)
+        if "Geography_Bilateral" not in xls.sheet_names:
+            st.info("No Geography Drill-Down lookups saved yet for this sector — run one above.")
+            return
+        geo_df = pd.read_excel(xls, "Geography_Bilateral", header=1, dtype={"HS Code": str})
+        geo_df.columns = [str(c).strip() for c in geo_df.columns]
+    except Exception as e:
+        st.warning(f"Could not read the Geography_Bilateral sheet: {e}")
+        return
+
+    if geo_df.empty:
+        st.info("Geography_Bilateral sheet is empty — run a lookup above.")
+        return
+
+    chart_type = st.selectbox("Chart type", CHART_TYPES, key="geo_chart_type")
+
+    if view_mode == "Single pair":
+        pair_df = geo_df[(geo_df["Reporter"] == reporter_name) & (geo_df["Partner"] == partner_name)
+                         & (geo_df["HS Code"].astype(str).str.strip().isin(active_hs))]
+        if pair_df.empty:
+            st.info(f"No saved data yet for {reporter_name} → {partner_name} with the HS code(s) "
+                    f"currently selected above. Run a lookup above (or widen the HS filter).")
+            with st.expander("View all saved Geography Drill-Down lookups"):
+                st.dataframe(geo_df, use_container_width=True)
+            return
+
+        metric = st.radio("Metric to chart", ["Trade Value (USD)", "Unit Price"],
+                          horizontal=True, key="geo_metric")
+
+        if metric == "Unit Price":
+            priced = pair_df[pair_df["Quantity"].notna() & (pair_df["Quantity"] > 0)]
+            if priced.empty:
+                st.info("No quantity data reported for this pair — unit price can't be computed.")
+            else:
+                up = (priced.groupby(["Year", "Flow", "Qty Unit"], as_index=False)
+                     .agg(**{"Trade Value (USD)": ("Trade Value (USD)", "sum"), "Quantity": ("Quantity", "sum")}))
+                up["Unit Price"] = (up["Trade Value (USD)"] / up["Quantity"]).round(4)
+                unit_sel = st.selectbox("Quantity unit", sorted(up["Qty Unit"].dropna().unique().tolist()),
+                                        key="geo_qty_unit")
+                wide = (up[up["Qty Unit"] == unit_sel]
+                       .pivot(index="Flow", columns="Year", values="Unit Price").reset_index())
+                fig = render_chart(wide, "Flow", chart_type, f"{reporter_name} ↔ {partner_name} — unit price",
+                                   f"USD per {unit_sel}", kind="trend", palette=palette)
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            agg = pair_df.groupby(["Year", "Flow"], as_index=False).agg(
+                **{"Trade Value (USD)": ("Trade Value (USD)", "sum")})
+            agg["Year"] = agg["Year"].astype(int)
+            wide = agg.pivot(index="Flow", columns="Year", values="Trade Value (USD)").reset_index()
+            fig = render_chart(wide, "Flow", chart_type, f"{reporter_name} ↔ {partner_name} — trade value (USD)",
+                               "USD", kind="trend", palette=palette)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with st.expander("View filtered rows for this pair"):
+            st.dataframe(pair_df, use_container_width=True)
+        with st.expander("View all saved Geography Drill-Down lookups"):
+            st.dataframe(geo_df, use_container_width=True)
+
+    else:
+        flow_label_variants = {"X": ["Export", "Exports"], "M": ["Import", "Imports"]}
+        wanted_partners = partner_names + (["World"] if include_world else [])
+        cmp_df = geo_df[(geo_df["Reporter"] == reporter_name)
+                       & (geo_df["Partner"].isin(wanted_partners))
+                       & (geo_df["Flow"].isin(flow_label_variants[flow_code]))
+                       & (geo_df["HS Code"].astype(str).str.strip().isin(active_hs))]
+        if cmp_df.empty:
+            st.info(f"No saved comparison data yet for {reporter_name} in this flow direction with the "
+                    f"HS code(s) currently selected above. Run a lookup above (or widen the HS filter).")
+            with st.expander("View all saved Geography Drill-Down lookups"):
+                st.dataframe(geo_df, use_container_width=True)
+            return
+
+        pct_share = st.checkbox("Show as % share", value=True, key="geo_pct_share")
+
+        agg = cmp_df.groupby(["Partner", "Year"], as_index=False).agg(
+            **{"Trade Value (USD)": ("Trade Value (USD)", "sum")})
+        agg["Year"] = agg["Year"].astype(int)
+        wide = agg.pivot(index="Partner", columns="Year", values="Trade Value (USD)").fillna(0)
+
+        has_world = "World" in wide.index
+        if has_world:
+            world_row = wide.loc["World"]
+            others    = wide.drop(index="World")
+            row_sel   = others.reindex([p for p in partner_names if p in others.index]).fillna(0)
+            rest      = (world_row - row_sel.sum()).clip(lower=0)
+            row_sel.loc["Rest of World"] = rest
+            wide = row_sel
+        else:
+            wide = wide.reindex([p for p in partner_names if p in wide.index])
+
+        unit_label = "USD"
+        if pct_share:
+            col_sums = wide.sum(axis=0).replace(0, pd.NA)
+            wide = (wide.div(col_sums, axis=1) * 100).round(2)
+            unit_label = "% share"
+
+        plot_df = wide.reset_index().rename(columns={"index": "Partner"})
+
+        title_suffix = "imports from" if flow_code == "M" else "exports to"
+        share_label = ("% of true total trade" if (pct_share and has_world)
+                      else "% among selected partners" if pct_share
+                      else "trade value (USD)")
+        fig = render_chart(plot_df, "Partner", chart_type,
+                           f"{reporter_name} — {title_suffix} selected partners ({share_label})",
+                           unit_label, kind="trend", palette=palette)
+        st.plotly_chart(fig, use_container_width=True)
+
+        if pct_share and not has_world:
+            st.caption("ℹ️ \"Include World total\" wasn't used, so these percentages are shares among "
+                      "the selected partners only — not the reporter's true total trade in this item.")
+
+        with st.expander("View filtered rows for this comparison"):
+            st.dataframe(cmp_df, use_container_width=True)
+        with st.expander("View all saved Geography Drill-Down lookups"):
+            st.dataframe(geo_df, use_container_width=True)
+
+def run_comtrade_app():
+    """Comtrade Sector Pipeline — auto-generate a sector config, run the
+    download/clean/competitor/visuals pipeline, then explore results as
+    interactive charts. All generated config/output files live under
+    COMTRADE_EXPORTS_DIR so they don't collide with the other modules in
+    this hub."""
+
+    def _cfg_full_path(p):
+        """Resolve a (possibly relative) config filename to its full path
+        inside COMTRADE_EXPORTS_DIR, for direct pandas file IO. Subprocess
+        calls instead pass the relative filename + cwd=COMTRADE_EXPORTS_DIR,
+        matching the convention already used by the helper functions above."""
+        return os.path.join(COMTRADE_EXPORTS_DIR, p) if p and not os.path.isabs(p) else p
+
+    st.title("⚡ Comtrade Sector Pipeline")
+    st.markdown("Select a sector, review the auto-generated configuration, run the pipeline, and explore the results as interactive charts.")
+
+    # Initialize session state variables
+    if "step" not in st.session_state:
+        st.session_state.step = 1
+    if "config_file_path" not in st.session_state:
+        st.session_state.config_file_path = None
+    if "run_timestamp" not in st.session_state:
+        st.session_state.run_timestamp = None
+    if "sector_name" not in st.session_state:
+        st.session_state.sector_name = None
+
+    def reset_app():
+        st.session_state.step = 1
+        st.session_state.config_file_path = None
+        st.session_state.run_timestamp = None
+        st.session_state.sector_name = None
+
+    st.sidebar.button("🔄 Reset Application", on_click=reset_app)
+
+    # ---------------------------------------------------------
+    # STEP 1: AUTO-GENERATE CONFIGURATION
+    # ---------------------------------------------------------
+    if st.session_state.step == 1:
+        st.header("Step 1: Select Sector")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            sector_choice = st.selectbox("Choose a Sector Template", list(SECTOR_PRESETS_COMTRADE.keys()))
+
+            if sector_choice == "Custom / Manual Entry":
+                sector_name = st.text_input("Sector Name", placeholder="e.g., Toys & Games")
+                groups = st.text_input(
+                    "DGCIS QE Groups (Semicolon separated)",
+                    help="Optional. Only fill this in if you want to auto-pull HS codes from an "
+                         "existing DGCIS Major Commodity Group (exact name required — see "
+                         "create_sector_config_from_qe.py --list). Leave this BLANK for a fully "
+                         "manual sector (e.g. one not covered by any DGCIS group, like Live Animals) "
+                         "— just enter the HS code(s) directly in 'Additional Custom HS Codes' below."
+                )
+            else:
+                sector_name = sector_choice
+                groups = SECTOR_PRESETS_COMTRADE[sector_choice]
+                st.info(f"**Auto-mapped DGCIS Groups:**\n{groups.replace(';', ' | ')}")
+
+        with col2:
+            hs_level = st.selectbox(
+                "HS Level Default", ["2", "4", "6"], index=0,
+                help="HS chapter granularity used to build the sector_buckets mapping. "
+                     "2-digit (chapter level) matches the reference cleaned-workbook format "
+                     "and is recommended — 4 or 6 digit codes still work for HS-code filtering "
+                     "but Sector Bucket grouping is always rolled up to 2-digit chapters downstream."
+            )
+            hs_filter_text = st.text_input(
+                "HS Chapter Filter (optional, comma-separated 2-digit chapters)",
+                placeholder="e.g., 64",
+                help="Restricts the sector to only these HS chapters, dropping every other code the "
+                     "QE group(s) would otherwise pull in. Use this when the product you want (e.g. "
+                     "Footwear) is only part of a broader DGCIS group (e.g. 'LEATHER AND LEATHER "
+                     "MANUFACTURES' also covers finished leather, leather garments, saddlery, etc.) "
+                     "— leave blank to include every chapter the selected group(s) contain."
+            )
+            add_codes_text = st.text_area("Additional Custom HS Codes (comma separated, optional)", placeholder="e.g., 9031,9032")
+            uploaded_hs_file = st.file_uploader("OR Upload CSV/Excel with Custom HS Codes (Codes in the first column)", type=["csv", "xlsx", "xls"])
+
+        if st.button("Generate & Review Configuration", type="primary"):
+            # Fully manual sector: "Custom / Manual Entry" chosen and the DGCIS QE
+            # Groups field left blank. There's no DGCIS Major Commodity Group for
+            # every sector (e.g. "Live Animals" / HS Chapter 01 isn't one of the
+            # 31 groups in the QE/PC mapping file), so this path skips QE-group
+            # matching entirely and builds the config from --add_codes only.
+            is_manual = (sector_choice == "Custom / Manual Entry" and not groups)
+
+            if not sector_name or (not groups and not is_manual):
+                st.error("Please provide a sector name and at least one QE group.")
+            elif is_manual and not add_codes_text and uploaded_hs_file is None:
+                st.error(
+                    "Manual entry needs at least one HS code — type one into "
+                    "'Additional Custom HS Codes' or upload a file, since no DGCIS QE group was given."
+                )
+            else:
+                # Process uploaded file
+                file_hs_codes = []
+                if uploaded_hs_file is not None:
+                    try:
+                        if uploaded_hs_file.name.endswith('.csv'):
+                            df_hs = pd.read_csv(uploaded_hs_file)
+                        else:
+                            df_hs = pd.read_excel(uploaded_hs_file)
+
+                        # Assume HS codes are in the first column
+                        if not df_hs.empty:
+                            first_col = df_hs.columns[0]
+                            # Convert to string, drop NAs, and clean up trailing .0 if read as floats
+                            raw_codes = df_hs[first_col].dropna().astype(str).str.replace(r'\.0$', '', regex=True).tolist()
+                            file_hs_codes.extend([c.strip() for c in raw_codes if c.strip()])
+                    except Exception as e:
+                        st.error(f"Could not read uploaded file: {e}")
+                        st.stop()
+
+                # Combine manual text codes and file codes
+                combined_codes = []
+                if add_codes_text:
+                    combined_codes.extend([c.strip() for c in add_codes_text.split(',') if c.strip()])
+                if file_hs_codes:
+                    combined_codes.extend(file_hs_codes)
+
+                final_add_codes_str = ",".join(combined_codes)
+
+                with st.spinner("Compiling sector mapping..."):
+                    cmd = [sys.executable, os.path.join(COMTRADE_DIR, "create_sector_config_from_qe.py")]
+                    cmd.extend(["--sector", sector_name])
+                    if is_manual:
+                        cmd.append("--manual")
+                    else:
+                        cmd.extend(["--groups" if ";" in groups else "--group", groups])
+                    cmd.extend(["--hs_level", hs_level])
+
+                    # HS chapter filter only means something when codes are being
+                    # pulled from a QE group — manual/blank configs have no group
+                    # codes to filter, so skip it there even if the field was left
+                    # filled in from a previous selection.
+                    if hs_filter_text.strip() and not is_manual:
+                        cmd.extend(["--hs_filter", hs_filter_text.strip()])
+
+                    # Pass the combined codes to the command line if any exist
+                    if final_add_codes_str:
+                        cmd.extend(["--add_codes", final_add_codes_str])
+
+                    try:
+                        result = subprocess.run(
+                            cmd, capture_output=True, text=True, check=True,
+                            env=SUBPROCESS_ENV, encoding="utf-8", errors="replace", cwd=COMTRADE_EXPORTS_DIR,
+                        )
+                        # IGNORECASE: the --manual CLI path prints "Blank config saved → ..."
+                        # (lowercase "config"), while --group/--groups print "Config saved → ..."
+                        match = re.search(r"config saved → (.*?\.xlsx)", result.stdout, re.IGNORECASE)
+                        if match:
+                            st.session_state.config_file_path = match.group(1).strip()
+                            st.session_state.sector_name = sector_name
+                            st.session_state.step = 2
+                            st.rerun()
+                        else:
+                            st.error("Could not determine the generated filename. Check logs:")
+                            st.code(result.stdout)
+                    except subprocess.CalledProcessError as e:
+                        st.error("Error generating config:")
+                        error_output = e.stderr if e.stderr and e.stderr.strip() else e.stdout
+                        st.code(error_output if error_output else f"Exit code {e.returncode} (No terminal output captured).", language="text")
+                    except Exception as e:
+                        st.error(f"An unexpected Python error occurred: {str(e)}")
+
+    # ---------------------------------------------------------
+    # STEP 2: REVIEW & EDIT
+    # ---------------------------------------------------------
+    elif st.session_state.step == 2:
+        st.header("Step 2: Review Sector Parameters")
+        st.markdown("We've automatically mapped the HS codes. Review them below and add any custom Buckets if needed.")
+
+        xls = pd.ExcelFile(_cfg_full_path(st.session_state.config_file_path))
+        sheets = {sheet: pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names}
+
+        tab1, tab2, tab3 = st.tabs(["📝 Details", "🪣 Buckets", "🔢 HS Codes"])
+
+        with tab1:
+            edited_details = st.data_editor(sheets.get("sector_details", pd.DataFrame()), use_container_width=True)
+        with tab2:
+            st.caption("Define custom analytic groups here. If left blank, the pipeline uses default HS chapters.")
+            edited_buckets = st.data_editor(sheets.get("sector_buckets", pd.DataFrame()), num_rows="dynamic", use_container_width=True)
+        with tab3:
+            st.caption("Change 'Include' to 'Exclude' to drop irrelevant codes from the pipeline.")
+            edited_hs_codes = st.data_editor(sheets.get("hs_codes", pd.DataFrame()), num_rows="dynamic", height=400, use_container_width=True)
+
+        col1, col2 = st.columns([1, 5])
+        with col1:
+            if st.button("← Back"):
+                st.session_state.step = 1
+                st.rerun()
+        with col2:
+            if st.button("Save & Proceed to Run Pipeline", type="primary"):
+                # Save edits silently
+                with pd.ExcelWriter(_cfg_full_path(st.session_state.config_file_path), engine="openpyxl") as writer:
+                    edited_details.to_excel(writer, sheet_name="sector_details", index=False)
+                    edited_buckets.to_excel(writer, sheet_name="sector_buckets", index=False)
+                    edited_hs_codes.to_excel(writer, sheet_name="hs_codes", index=False)
+                    for sheet in sheets:
+                        if sheet not in ["sector_details", "sector_buckets", "hs_codes"]:
+                            sheets[sheet].to_excel(writer, sheet_name=sheet, index=False)
+
+                st.session_state.step = 3
+                st.rerun()
+
+    # ---------------------------------------------------------
+    # STEP 3: RUN, EXPLORE VISUALS & DOWNLOAD OUTPUTS
+    # ---------------------------------------------------------
+    elif st.session_state.step == 3:
+        st.header("Step 3: Execute & Explore")
+
+        # Single point of API-key handling for the whole app: prefer a value
+        # already configured via Streamlit Secrets (st.secrets["COMTRADE_API_KEY"],
+        # set in .streamlit/secrets.toml or the Streamlit Cloud dashboard) or a
+        # local .env-style environment variable, so a deployed app doesn't force
+        # every user to paste the key in by hand. The text input still lets
+        # anyone override it for a single run.
+        _default_key = ""
+        _secrets_paths = [
+            Path.home() / ".streamlit" / "secrets.toml",
+            Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+        ]
+        if any(p.exists() for p in _secrets_paths):
+            # Only touch st.secrets if a secrets.toml actually exists - st.secrets
+            # itself renders a "No secrets files found" warning banner into the
+            # app on first access when no file is present, even when the access
+            # is wrapped in try/except (the banner isn't a Python exception, so
+            # try/except can't suppress it).
+            try:
+                _default_key = st.secrets.get("COMTRADE_API_KEY", "")
+            except Exception:
+                pass
+        if not _default_key:
+            _default_key = os.environ.get("COMTRADE_API_KEY", "")
+
+        api_key = st.text_input(
+            "UN Comtrade API Key",
+            value=_default_key,
+            type="password",
+            help="Pre-filled automatically if COMTRADE_API_KEY is set via Streamlit "
+                 "Secrets or a .env/environment variable. Paste a different key here "
+                 "to override it for this run.",
+        )
+
+        # Map human-readable dropdown options ("Output type") to lists of
+        # execution modes. No PPTX/deck is ever produced by any of these —
+        # "visuals_data" only writes the chart-data workbook used to render
+        # live charts below, and "slide_ready" only writes an Excel summary-
+        # tables workbook (the pipeline's run_pptx step is never invoked from
+        # this app). "competitor_full" is chained right after "clean" so the
+        # cleaned workbook always gets its 5 Competitor_* sheets — previously
+        # this was missing because no dropdown option ever ran it.
+        pipeline_modes_map = {
+            "🚀 Full Auto-Sequence (Download → Clean → Competitor → Visuals → Summary)":
+                ["full", "clean", "competitor_full", "visuals_data", "slide_ready"],
+            "Setup Check Only": ["setup_check"],
+            "Test Sample Only (1 HS code, 1 year)": ["test"],
+            "Full Data Download Only": ["full"],
+            "Cleaned Excel Workbook (incl. Competitor Analysis)": ["clean", "competitor_full"],
+            "Generate Visuals Only": ["visuals_data"],
+            "Generate Summary Tables Only": ["slide_ready"],
+        }
+
+        col1, col2 = st.columns(2)
+        with col1:
+            selected_label = st.selectbox("Select Output Type", list(pipeline_modes_map.keys()), index=0)
+            modes_to_run = pipeline_modes_map[selected_label]
+            st.caption("Pipeline modes that will run: " + " → ".join(f"`{m}`" for m in modes_to_run))
+
+        # Year-range override — the config file's "years" sheet has its own
+        # Start/End Year, but that's a static value baked in once at sector
+        # setup time and easy to go stale. Rather than asking anyone to open
+        # that file, expose it here: if the config's End Year is older than
+        # "last year," default to overriding it so a run pulls the freshest
+        # data automatically. Applies to every mode below via --start-year/
+        # --end-year — the config file itself is never modified.
+        import datetime as _dt3
+        _auto_latest3 = _dt3.date.today().year - 1
+        try:
+            _dfy3 = pd.read_excel(_cfg_full_path(st.session_state.config_file_path), "years", header=1)
+            _dfy3.columns = [str(c).strip() for c in _dfy3.columns]
+            _cfg_start3 = int(float(_dfy3.iloc[0]["Start Year"]))
+            _ey3 = _dfy3.iloc[0].get("End Year", None)
+            _cfg_end3 = (int(float(_ey3)) if pd.notna(_ey3) and str(_ey3).strip().lower() not in ("", "auto", "latest", "nan")
+                        else _auto_latest3)
+        except Exception:
+            _cfg_start3, _cfg_end3 = _auto_latest3 - 10, _auto_latest3
+
+        year_override = None
+        with col2:
+            override_on = st.checkbox(
+                f"Override year range (config file currently says {_cfg_start3}–{_cfg_end3})",
+                value=(_cfg_end3 < _auto_latest3), key="pipeline_year_override_on")
+            if override_on:
+                year_override = st.slider(
+                    "Years to fetch this run", min(_cfg_start3, _auto_latest3 - 10), _auto_latest3,
+                    (_cfg_start3, _auto_latest3), key="pipeline_year_override_range")
+                st.caption(f"Will fetch {year_override[0]}–{year_override[1]} for this run only "
+                           f"(config file's own Start/End Year is left untouched).")
+
+        if st.button("🚀 Run Pipeline", type="primary"):
+            # Check if an API key is required for any of the selected modes
+            requires_api = any(m in ["test", "full"] for m in modes_to_run)
+
+            if not api_key and requires_api:
+                st.error("API Key is required to fetch data for the selected mode(s).")
+            else:
+                if api_key:
+                    os.environ["COMTRADE_API_KEY"] = api_key
+
+                # Record the time before running to find freshly modified files later
+                st.session_state.run_timestamp = time.time()
+
+                log_container = st.empty()
+                log_text = ""
+
+                total_steps = len(modes_to_run)
+                progress_bar = st.progress(0) if total_steps > 1 else None
+
+                pipeline_failed = False
+
+                # Execute each selected mode sequentially
+                for idx, current_mode in enumerate(modes_to_run):
+                    step_indicator = f"Step {idx + 1}/{total_steps}: Running `{current_mode}`" if total_steps > 1 else f"Running `{current_mode}`"
+
+                    with st.spinner(f"{step_indicator}... Please wait."):
+                        cmd = [sys.executable, os.path.join(COMTRADE_DIR, "sector_comtrade_pipeline.py"), "--config", st.session_state.config_file_path, "--mode", current_mode]
+                        if year_override:
+                            cmd += ["--start-year", str(year_override[0]), "--end-year", str(year_override[1])]
+
+                        try:
+                            process = subprocess.Popen(
+                                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                env=SUBPROCESS_ENV, encoding="utf-8", errors="replace", cwd=COMTRADE_EXPORTS_DIR,
+                            )
+
+                            for line in iter(process.stdout.readline, ''):
+                                log_text += line
+                                # Truncate to the last 2000 characters to prevent memory lag
+                                log_container.code(log_text[-2000:], language="text")
+
+                            process.wait()
+
+                            if process.returncode != 0:
+                                st.error(f"❌ Pipeline encountered an error during `{current_mode}`. Check logs above.")
+                                pipeline_failed = True
+                                break # Halt the sequence if a step fails
+
+                        except Exception as e:
+                            st.error(f"An unexpected error occurred: {e}")
+                            pipeline_failed = True
+                            break
+
+                    # Update progress bar if there are multiple steps
+                    if progress_bar:
+                        progress_bar.progress((idx + 1) / total_steps)
+
+                if not pipeline_failed:
+                    st.success("✅ Pipeline execution complete!")
+
+                    # Diagnostics: if this run touched the cleaned workbook, check it
+                    # for the common failure modes (empty Master_Table, missing
+                    # competitor sheets, mostly-"Other" bucket mapping) so a broken
+                    # sector shows a clear message instead of a blank/odd-looking output.
+                    if any(m in ("clean", "competitor_full", "competitor_test") for m in modes_to_run):
+                        cleaned_check = locate_cleaned_workbook(_cfg_full_path(st.session_state.config_file_path))
+                        st.markdown("**Cleaned workbook diagnostics:**")
+                        for level, msg in diagnose_cleaned_workbook(cleaned_check):
+                            {"error": st.error, "warning": st.warning, "success": st.success}[level](msg)
+
+        # Interactive Visuals Section: shows live, filterable charts built from
+        # whatever sector the user is currently working with — no deck involved.
+        chart_data_path = locate_chart_data_workbook(_cfg_full_path(st.session_state.config_file_path))
+        if chart_data_path:
+            st.divider()
+            show_interactive_visuals(chart_data_path, st.session_state.sector_name or "Sector")
+
+        # Master_Table explorer: free-form filtering (year range, trade flow,
+        # reporter/competitor countries, sector bucket) over the cleaned workbook,
+        # independent of the fixed Chart1-8 set above.
+        cleaned_path_for_explore = locate_cleaned_workbook(_cfg_full_path(st.session_state.config_file_path))
+        if cleaned_path_for_explore:
+            st.divider()
+            render_master_table_explorer(cleaned_path_for_explore, st.session_state.sector_name or "Sector")
+
+        # Geography Drill-Down: bilateral reporter<->partner lookup. Shown even
+        # before the cleaned workbook exists yet (a lookup here will create it),
+        # unlike the explorer above which needs Master_Table to already exist.
+        st.divider()
+        render_geography_drilldown(st.session_state.config_file_path, cleaned_path_for_explore,
+                                   st.session_state.sector_name or "Sector", api_key)
+
+        # File Download Section: Scans directory for newly updated Excel/CSV files
+        if st.session_state.run_timestamp:
+            st.divider()
+            st.subheader("📥 Download Outputs")
+
+            output_files_found = False
+            current_dir = COMTRADE_EXPORTS_DIR
+
+            for filename in os.listdir(current_dir):
+                if filename.endswith((".xlsx", ".csv")):
+                    filepath = os.path.join(current_dir, filename)
+                    # If the file was modified AFTER the run button was clicked
+                    if os.path.getmtime(filepath) >= st.session_state.run_timestamp:
+                        # Ignore the config file itself
+                        if filename != st.session_state.config_file_path:
+                            output_files_found = True
+                            with open(filepath, "rb") as file_data:
+                                file_bytes = file_data.read()
+
+                                st.download_button(
+                                    label=f"Download 📊 {filename}",
+                                    data=file_bytes,
+                                    file_name=filename,
+                                    mime="application/octet-stream"
+                                )
+
+            if not output_files_found:
+                st.info("No new output files generated yet.")
+
 # ==============================================================================
 # 2. INDIVIDUAL APP MODULES
 # ==============================================================================
@@ -642,128 +1487,336 @@ def run_asi_app():
         except Exception as e:
             st.sidebar.error("⚠️ Could not read dictionary. Make sure it's a valid CSV.")
 
-    def process_block_a(file_buffer) -> pd.DataFrame:
-        df = pd.read_csv(file_buffer, dtype={"a1": str, "a5": str, "a7": str})
+    # Extended and comprehensive variable mapping dictionary
+    ASI_VAR_LABELS = {
+        "yr": "'24' for ASI 2023-2024", "blk": "Block code", "a1": "DSL", "a2": "PSL No.", 
+        "a3": "Scheme code (Census-1, Sample-2)", "a4": "Ind. Code as per Frame (4-digit NIC)", 
+        "a5": "Ind Code as per Return (5-digit NIC)", "a7": "State Code", "a8": "District code", 
+        "a9": "Sector (Rural-1, Urban-2)", "a10": "RO/SRO code", "a11": "No. of units", 
+        "a12": "Status of Unit", "bonus": "Bonus", "pf": "Provident Fund", 
+        "welfare": "Welfare Expenses", "mwdays": "Number of working days (Manufacturing)", 
+        "nwdays": "Number of working days (Non-Manufacturing)", "wdays": "Number of working days (Total)", 
+        "costop": "Total Cost of Production", "expshare": "Share(%) of products/by-products directly exported", 
+        "mult": "Multiplier", "ab01": "DSL (Block-A, Item 1)", "b02": "Type of organisation(code)", 
+        "b03": "Corporate Identification Number (CIN)", "b04": "ISO Certification, 14000 Series", 
+        "b05": "Year of initial production", "b06f": "Accounting year (From)", "b06t": "Accounting year (To)", 
+        "b07": "Number of months of operation", "b08": "Share capital includes foreign entities?", 
+        "b09": "R&D unit in factory?", "b11": "Formal training offered", "ac01": "DSL (Block-A, Item 1)", 
+        "c 11": "SL. No.", "c 13": "Gross Value Opening as on", "c_14": "Gross Value of Addition due to Revaluation", 
+        "c 15": "Gross Value of Actual addition", "c 16": "Gross Value of Deduction & adjustment", 
+        "c 17": "Gross Value Closing as on", "c 18": "Depreciation Up to year beginning", 
+        "c 19": "Depreciation Provided during the year", "c 110": "Depreciation due to Adjustment for sold/discarded", 
+        "c 111": "Depreciation Up to year end", "c_112": "Net Value Opening as on", "c 113": "Net Value Closing as on",
+        "ad01": "DSL (Block-A, Item 1)", "dii": "SL. No.", "d 13": "Opening (Rs.)", "d 14": "Closing (Rs.)",
+        "ae01": "DSL (Block-A, Item 1)", "e 11": "SL. No.", "e 13": "Mandays Worked (Manufacturing)", 
+        "e 14": "Mandays Worked (Non Manufacturing)", "e 15": "Mandays Worked (Total)", 
+        "e 16": "Average Number of persons worked", "e 17": "No. of mandays paid for", "e 18": "Wages/salaries (in Rs.)",
+        
+        "f1": "Work done by others", "f2a": "Repair & maintenance (Building)", "f2b": "Repair & maintenance (Other)",
+        "f3": "Operating expenses", "f4": "Own construction expenses", "f5": "Insurance Charges", 
+        "f6": "Rent paid for Plant & Machinery", "f7": "R&D Expenses", "f8": "Rent paid for Buildings", 
+        "f9": "Rent paid for land / royalties", "f10": "Interest paid", "f11": "Purchase value of goods resold", 
+        "f12": "Inward transportation cost", "f13": "Outward transportation cost",
+        
+        "g1": "Receipts from mfg services", "g2": "Receipts from non-mfg services", "g3": "Value in electricity generated and sold",
+        "g4": "Value of own construction", "g5": "Net balance of goods resold", "g6": "Rent received for Plant & Machinery",
+        "g7": "Variation in stock of semi-finished goods", "g8": "Rent received for buildings", "g9": "Rent received for land / royalties",
+        "g10": "Interest received", "g11": "Sale value of goods resold", "g12": "Other production subsidies",
+        
+        "h12": "Basic items consumed (Value)", "h13": "Non-basic chemicals consumed (Value)", "h14": "Packing items consumed (Value)",
+        "h15": "Electricity own generated (Value)", "h16": "Electricity purchased (Value)", "h17": "Petrol, diesel, oil, lubricants (Value)",
+        "h18": "Coal consumed (Value)", "h19": "Gas consumed (Value)", "h20": "Other fuel consumed (Value)", "h21": "Consumable store (Value)",
+        
+        "j13": "Item code (NPCMS) - Products", "j15": "Quantity manufactured", "j17": "Gross sale value (Rs.)",
+        
+        "imported_total_inputs": "Total Imported Inputs", "indigenous_total_inputs": "Total Indigenous Inputs",
+        "depreciation_annexure": "Depreciation (Annexure VIII)", "nfcf_without_f7": "Net Fixed Capital Formation (Excl. R&D)",
+        "materials_fuels_stores_opening": "Opening Stock: Materials, Fuels, Stores", "materials_fuels_stores_closing": "Closing Stock: Materials, Fuels, Stores",
+        "semi_finished_opening": "Opening Stock: Semi-finished", "semi_finished_closing": "Closing Stock: Semi-finished",
+        "finished_goods_opening": "Opening Stock: Finished Goods", "finished_goods_closing": "Closing Stock: Finished Goods",
+        "total_employee_wages": "Total Employee Wages", "total_workers": "Total Workers", "women_workers": "Women Workers",
+        "fixed_assets_net_closing": "Fixed Assets: Net Closing Value", "plant_machinery_gross_closing": "Plant & Machinery: Gross Closing Value",
+        "actual_addition_fixed_assets": "Actual Addition to Fixed Assets", "working_capital": "Working Capital (Block D)",
+        "total_inventory_closing": "Total Inventory (Closing)", "outstanding_loans": "Outstanding Loans (Block D)",
+        "gross_sale_value_item12": "Gross Sale Value (Item 12)", "gst_item12": "GST (Item 12)",
+        "excise_vat_other_taxes_item12": "Excise/VAT/Other Taxes (Item 12)", "other_distributive_expenses_item12": "Other Distributive Expenses (Item 12)",
+        "subsidy_item12": "Subsidy (Item 12)", "ex_factory_value_item12": "Ex-factory Value (Item 12)",
+        
+        # Principal Characteristics
+        "pc_01_number_of_factories": "PC 01: Number of Factories",
+        "pc_02_factories_in_operation": "PC 02: Factories in Operation",
+        "pc_03_fixed_capital": "PC 03: Fixed Capital",
+        "pc_04_physical_working_capital": "PC 04: Physical Working Capital",
+        "pc_05_working_capital": "PC 05: Working Capital",
+        "pc_06_invested_capital": "PC 06: Invested Capital",
+        "pc_07_gross_value_addition_fixed_capital": "PC 07: Gross Value of Addition to Fixed Capital",
+        "pc_08_rent_paid_fixed_assets": "PC 08: Rent Paid for Fixed Assets",
+        "pc_09_outstanding_loan": "PC 09: Outstanding Loan",
+        "pc_10_interest_paid": "PC 10: Interest Paid",
+        "pc_11_rent_received_fixed_assets": "PC 11: Rent Received for Fixed Assets",
+        "pc_12_interest_received": "PC 12: Interest Received",
+        "pc_13_gross_value_plant_machinery": "PC 13: Gross Value of Plant & Machinery",
+        "pc_14_value_product_byproduct": "PC 14: Value of Product and By-Product",
+        "pc_15_total_output": "PC 15: Total Output",
+        "pc_16_fuels_consumed": "PC 16: Fuels Consumed",
+        "pc_17_materials_consumed": "PC 17: Materials Consumed",
+        "pc_18_total_inputs": "PC 18: Total Inputs",
+        "pc_19_gross_value_added": "PC 19: Gross Value Added",
+        "pc_20_depreciation": "PC 20: Depreciation",
+        "pc_21_net_value_added": "PC 21: Net Value Added",
+        "pc_22_net_fixed_capital_formation": "PC 22: Net Fixed Capital Formation",
+        "pc_23_gross_fixed_capital_formation": "PC 23: Gross Fixed Capital Formation",
+        "pc_24_addition_in_stock": "PC 24: Addition in Stock",
+        "pc_25_gross_capital_formation": "PC 25: Gross Capital Formation",
+        "pc_26_net_income": "PC 26: Net Income",
+        "pc_27_net_profit": "PC 27: Net Profit"
+    }
+
+    def _norm_df(df, id_col):
         df.columns = df.columns.str.lower().str.strip()
-        if "a5" in df.columns: df["a5"] = df["a5"].astype(str).str.strip().str.zfill(5)
-        if "a7" in df.columns: df["a7"] = df["a7"].astype(str).str.strip().str.zfill(2)
+        if id_col.lower() in df.columns:
+            df = df.rename(columns={id_col.lower(): 'dsl'})
+        elif 'a1' in df.columns:
+            df = df.rename(columns={'a1': 'dsl'})
+        df['dsl'] = df['dsl'].astype(str)
         return df
 
-    def process_block_e(file_buffer) -> pd.DataFrame:
-        df = pd.read_csv(file_buffer)
-        df.columns = df.columns.str.upper().str.strip()
-        if "AE01" in df.columns: df = df.rename(columns={"AE01": "a1"})
-        elif "A1" in df.columns: df = df.rename(columns={"A1": "a1"})
-        if "a1" in df.columns: df["a1"] = df["a1"].astype(str)
-        if "EI1" in df.columns: df["EI1"] = pd.to_numeric(df["EI1"], errors="coerce")
-            
-        TOTAL_ROW_CODE = 6; WOMEN_ROW_CODE = 2; BONUS_ROW_CODE = 11; PF_ROW_CODE = 12; WELFARE_ROW_CODE = 13  
-
-        if set(["a1", "EI1", "EI6", "EI8"]).issubset(df.columns):
-            total = df[df["EI1"] == TOTAL_ROW_CODE][["a1", "EI6", "EI8"]].rename(columns={"EI6": "total_workers", "EI8": "total_wages"}).copy()
-            women = df[df["EI1"] == WOMEN_ROW_CODE][["a1", "EI6"]].rename(columns={"EI6": "women_workers"}).copy()
-            bonus = df[df["EI1"] == BONUS_ROW_CODE][["a1", "EI8"]].rename(columns={"EI8": "bonus"}).copy()
-            pf = df[df["EI1"] == PF_ROW_CODE][["a1", "EI8"]].rename(columns={"EI8": "pf"}).copy()
-            welfare = df[df["EI1"] == WELFARE_ROW_CODE][["a1", "EI8"]].rename(columns={"EI8": "welfare"}).copy()
-            emp = total.merge(women, on="a1", how="left").merge(bonus, on="a1", how="left").merge(pf, on="a1", how="left").merge(welfare, on="a1", how="left")
-        else:
-            emp = pd.DataFrame(columns=["a1"])
-            if "a1" in df.columns: emp["a1"] = emp["a1"].unique()
-        
-        for col in ["total_workers", "total_wages", "women_workers", "bonus", "pf", "welfare"]:
-            if col in emp.columns: emp[col] = pd.to_numeric(emp[col], errors="coerce").fillna(0)
-            else: emp[col] = 0 
-        return emp
-
-    def process_block_c(file_buffer) -> pd.DataFrame:
-        df = pd.read_csv(file_buffer, dtype={"AC01": str, "ac01": str})
-        df.columns = df.columns.str.lower().str.strip()
-        if "ac01" in df.columns: df = df.rename(columns={"ac01": "a1"})
-        if "c_11" in df.columns and "c_113" in df.columns:
-            row10 = df[df["c_11"] == 10][["a1", "c_113"]].copy()
-            row10 = row10.rename(columns={"c_113": "fixed_capital"})
-            row10["fixed_capital"] = pd.to_numeric(row10["fixed_capital"], errors="coerce").fillna(0)
-            return row10
-        return pd.DataFrame(columns=["a1", "fixed_capital"])
-
-    def process_generic_block(file_buffer, filename) -> pd.DataFrame:
-        df = pd.read_csv(file_buffer)
-        df.columns = df.columns.str.lower().str.strip()
-        key_col = None
-        for k in ["a1", "dsl", "blk_a_id", "vsl"]:
-            if k in df.columns:
-                key_col = k
-                break
-        if not key_col and len(df.columns) > 0: key_col = df.columns[0]
-        df = df.rename(columns={key_col: "a1"})
-        df["a1"] = df["a1"].astype(str)
-        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if "a1" in num_cols: num_cols.remove("a1")
-        if num_cols:
-            df = df.groupby("a1")[num_cols].sum().reset_index()
-            prefix = str(filename).split('.')[0][:7].upper() + "_"
-            df = df.rename(columns={c: prefix + c for c in num_cols})
-        else:
-            df = df.drop_duplicates("a1")
-        return df
-
-    st.markdown("### 📥 Primary Data Ingestion")
+    st.markdown("### 📥 Primary Data Ingestion (All 10 Blocks Required)")
     
-    use_custom_asi = st.checkbox("Upload custom ASI data files instead of using local defaults")
+    st.info("Upload all 10 standard ASI blocks to unlock the 27 Principal Characteristics auto-computation engine.")
     
-    file_a = None
-    file_c = None
-    file_e = None
-    extra_files = None
+    c1, c2, c3, c4, c5 = st.columns(5)
+    file_a = c1.file_uploader("Block A", type=["csv"])
+    file_b = c2.file_uploader("Block B", type=["csv"])
+    file_c = c3.file_uploader("Block C", type=["csv"])
+    file_d = c4.file_uploader("Block D", type=["csv"])
+    file_e = c5.file_uploader("Block E", type=["csv"])
     
-    if use_custom_asi:
-        c_up1, c_up2, c_up3 = st.columns(3)
-        file_a = c_up1.file_uploader("Upload Summary/Identification (Block A)", type=["csv"])
-        file_c = c_up2.file_uploader("Upload Fixed Capital (Block C)", type=["csv"])
-        file_e = c_up3.file_uploader("Upload Employment (Block E)", type=["csv"])
-        extra_files = st.file_uploader("Upload ANY Additional Blocks (B, D, F, G, H, I, J, etc) to extract more variables", type=["csv"], accept_multiple_files=True)
-    else:
-        default_a = os.path.join("data", "Block_A.csv")
-        default_c = os.path.join("data", "Block_C.csv")
-        default_e = os.path.join("data", "Block_E.csv")
-        
-        if os.path.exists(default_a) and os.path.exists(default_c) and os.path.exists(default_e):
-            file_a = default_a
-            file_c = default_c
-            file_e = default_e
-            st.success("✅ Automatically loaded local ASI default files from the `data/` directory.")
-        else:
-            st.info("💡 Default ASI files (`Block_A.csv`, `Block_C.csv`, `Block_E.csv`) were not found in the `data/` directory. Please upload them manually by checking the box above.")
+    c6, c7, c8, c9, c10 = st.columns(5)
+    file_f = c6.file_uploader("Block F", type=["csv"])
+    file_g = c7.file_uploader("Block G", type=["csv"])
+    file_h = c8.file_uploader("Block H", type=["csv"])
+    file_i = c9.file_uploader("Block I", type=["csv"])
+    file_j = c10.file_uploader("Block J", type=["csv"])
 
-    if file_a and file_c and file_e:
+    if all([file_a, file_b, file_c, file_d, file_e, file_f, file_g, file_h, file_i, file_j]):
         if not nic_codes_list:
             st.error("❌ Configure at least one active NIC parameter in the control console to initialize calculations.")
         else:
-            with st.spinner("Compiling database tables and synchronizing survey weights..."):
-                df_a = process_block_a(file_a)
-                df_e = process_block_e(file_e)
-                df_c = process_block_c(file_c)
+            with st.spinner("Compiling database tables, syncing weights, and computing the 27 Principal Characteristics..."):
+                # 1. Base Factory (Block A & B)
+                df_A = _norm_df(pd.read_csv(file_a, dtype={"a1": str, "a5": str, "a7": str}), 'a1')
+                if "a5" in df_A.columns: df_A["a5"] = df_A["a5"].astype(str).str.strip().str.zfill(5)
+                if "a7" in df_A.columns: df_A["a7"] = df_A["a7"].astype(str).str.strip().str.zfill(2)
                 
-                merged = df_a.merge(df_e, on="a1", how="left").merge(df_c, on="a1", how="left")
+                df_B = _norm_df(pd.read_csv(file_b), 'ab01')
                 
-                if extra_files:
-                    for ext_f in extra_files:
-                        try:
-                            ext_df = process_generic_block(ext_f, ext_f.name)
-                            merged = merged.merge(ext_df, on="a1", how="left")
-                        except Exception as e:
-                            st.warning(f"Could not fully parse {ext_f.name}: {e}")
+                # 2. Block C Processing
+                df_C = _norm_df(pd.read_csv(file_c), 'ac01')
+                for c in ['c_11', 'c_19', 'c_112', 'c_113', 'c_14', 'c_15', 'c_17']:
+                    if c in df_C.columns: df_C[c] = pd.to_numeric(df_C[c], errors='coerce').fillna(0)
+                    else: df_C[c] = 0
+
+                annex_mask = df_C['c_11'].isin([1,2,3,4,5,6,7,9])
+                c_annex = df_C[annex_mask].groupby('dsl').apply(lambda x: pd.Series({
+                    'depreciation_annexure': x['c_19'].sum(),
+                    'nfcf_without_f7': (x['c_113'] - x['c_112'] - x['c_14']).sum()
+                })).reset_index()
                 
-                safe_cols = ["fixed_capital", "total_wages", "bonus", "pf", "welfare", "total_workers", "women_workers", "costop", "mult"]
-                for col in safe_cols:
-                    if col not in merged.columns: merged[col] = 0
+                c_10 = df_C[df_C['c_11'] == 10].groupby('dsl').agg(
+                    fixed_assets_net_closing=('c_113', 'first'),
+                    actual_addition_fixed_assets=('c_15', 'first')
+                ).reset_index()
+
+                c_3 = df_C[df_C['c_11'] == 3].groupby('dsl').agg(
+                    plant_machinery_gross_closing=('c_17', 'first')
+                ).reset_index()
+
+                df_C_merged = c_annex.merge(c_10, on='dsl', how='outer').merge(c_3, on='dsl', how='outer')
+
+                # 3. Block D Processing
+                df_D = _norm_df(pd.read_csv(file_d), 'ad01')
+                for c in ['di1', 'di3', 'di4', 'd 11', 'd 13', 'd 14']:
+                    if c in df_D.columns: df_D[c] = pd.to_numeric(df_D[c], errors='coerce')
                 
-                merged["fixed_capital"] = merged["fixed_capital"].fillna(0)
+                d_id = 'di1' if 'di1' in df_D.columns else 'd 11' if 'd 11' in df_D.columns else None
+                d_op = 'di3' if 'di3' in df_D.columns else 'd 13' if 'd 13' in df_D.columns else None
+                d_cl = 'di4' if 'di4' in df_D.columns else 'd 14' if 'd 14' in df_D.columns else None
+                
+                if all([d_id, d_op, d_cl]):
+                    def ext_d(item_id, col_name, out_name):
+                        return df_D[df_D[d_id] == item_id].groupby('dsl')[col_name].first().rename(out_name)
+                    df_D_merged = pd.concat([
+                        ext_d(4, d_op, 'materials_fuels_stores_opening'), ext_d(4, d_cl, 'materials_fuels_stores_closing'),
+                        ext_d(5, d_op, 'semi_finished_opening'), ext_d(5, d_cl, 'semi_finished_closing'),
+                        ext_d(6, d_op, 'finished_goods_opening'), ext_d(6, d_cl, 'finished_goods_closing'),
+                        ext_d(7, d_cl, 'total_inventory_closing'), ext_d(16, d_cl, 'working_capital'),
+                        ext_d(17, d_cl, 'outstanding_loans')
+                    ], axis=1).reset_index()
+                else: df_D_merged = pd.DataFrame(columns=['dsl'])
+
+                # 4. Block E Processing
+                df_E = _norm_df(pd.read_csv(file_e), 'ae01')
+                e_id = 'ei1' if 'ei1' in df_E.columns else 'e 11'
+                e_wages = 'ei8' if 'ei8' in df_E.columns else 'e 18'
+                e_workers = 'ei6' if 'ei6' in df_E.columns else 'e 16'
+                for c in [e_id, e_wages, e_workers]:
+                    if c in df_E.columns: df_E[c] = pd.to_numeric(df_E[c], errors='coerce')
+                
+                if e_id in df_E.columns:
+                    e10 = df_E[df_E[e_id] == 10].groupby('dsl')[e_wages].first().rename('total_employee_wages')
+                    e6_tot = df_E[df_E[e_id] == 6].groupby('dsl')[e_workers].first().rename('total_workers')
+                    e2_wom = df_E[df_E[e_id] == 2].groupby('dsl')[e_workers].first().rename('women_workers')
+                    df_E_merged = pd.concat([e10, e6_tot, e2_wom], axis=1).reset_index()
+                else: df_E_merged = pd.DataFrame(columns=['dsl'])
+
+                # 5. Block F & G Processing
+                df_F = _norm_df(pd.read_csv(file_f), 'af01')
+                df_G = _norm_df(pd.read_csv(file_g), 'ag01')
+                df_F_merged = df_F.groupby('dsl').sum(numeric_only=True).reset_index()
+                df_G_merged = df_G.groupby('dsl').sum(numeric_only=True).reset_index()
+
+                # 6. Block H Processing
+                df_H = _norm_df(pd.read_csv(file_h), 'ah01')
+                h_id = 'hi1' if 'hi1' in df_H.columns else 'h 11'
+                h_val = 'hi6' if 'hi6' in df_H.columns else 'h 16'
+                for c in [h_id, h_val]:
+                    if c in df_H.columns: df_H[c] = pd.to_numeric(df_H[c], errors='coerce')
+                if h_id in df_H.columns:
+                    def ext_h(i, n): return df_H[df_H[h_id] == i].groupby('dsl')[h_val].first().rename(n)
+                    df_H_merged = pd.concat([
+                        ext_h(15, 'h15'), ext_h(16, 'h16'), ext_h(17, 'h17'), ext_h(18, 'h18'), 
+                        ext_h(19, 'h19'), ext_h(20, 'h20'), ext_h(12, 'h12'), ext_h(13, 'h13'), 
+                        ext_h(14, 'h14'), ext_h(21, 'h21'), ext_h(23, 'indigenous_total_inputs')
+                    ], axis=1).reset_index()
+                else: df_H_merged = pd.DataFrame(columns=['dsl'])
+
+                # 7. Block I Processing
+                df_I = _norm_df(pd.read_csv(file_i), 'ai01')
+                i_id = 'ii1' if 'ii1' in df_I.columns else 'i 11'
+                i_val = 'ii6' if 'ii6' in df_I.columns else 'i 16'
+                for c in [i_id, i_val]: 
+                    if c in df_I.columns: df_I[c] = pd.to_numeric(df_I[c], errors='coerce')
+                if i_id in df_I.columns:
+                    df_I_merged = df_I[df_I[i_id] == 7].groupby('dsl')[i_val].first().rename('imported_total_inputs').reset_index()
+                else: df_I_merged = pd.DataFrame(columns=['dsl'])
+
+                # 8. Block J Processing
+                df_J = _norm_df(pd.read_csv(file_j), 'aj01')
+                j_id = 'j11' if 'j11' in df_J.columns else 'j 11'
+                
+                for c in [j_id, 'j17', 'j18', 'j19', 'j110', 'j111', 'j113', 'j 17', 'j 18', 'j 19', 'j 110', 'j 111', 'j 113']:
+                    if c in df_J.columns: df_J[c] = pd.to_numeric(df_J[c], errors='coerce')
+                        
+                j17_col = 'j17' if 'j17' in df_J.columns else 'j 17' if 'j 17' in df_J.columns else None
+                j18_col = 'j18' if 'j18' in df_J.columns else 'j 18' if 'j 18' in df_J.columns else None
+                j19_col = 'j19' if 'j19' in df_J.columns else 'j 19' if 'j 19' in df_J.columns else None
+                j110_col = 'j110' if 'j110' in df_J.columns else 'j 110' if 'j 110' in df_J.columns else None
+                j111_col = 'j111' if 'j111' in df_J.columns else 'j 111' if 'j 111' in df_J.columns else None
+                j113_col = 'j113' if 'j113' in df_J.columns else 'j 113' if 'j 113' in df_J.columns else None
+
+                if j_id in df_J.columns and j17_col and j18_col and j113_col:
+                    agg_dict = {
+                        'gross_sale_value_item12': (j17_col, 'first'),
+                        'gst_item12': (j18_col, 'first'),
+                        'ex_factory_value_item12': (j113_col, 'first')
+                    }
+                    if j19_col: agg_dict['excise_vat_other_taxes_item12'] = (j19_col, 'first')
+                    if j110_col: agg_dict['other_distributive_expenses_item12'] = (j110_col, 'first')
+                    if j111_col: agg_dict['subsidy_item12'] = (j111_col, 'first')
+
+                    df_J_merged = df_J[df_J[j_id] == 12].groupby('dsl').agg(**agg_dict).reset_index()
+                else: df_J_merged = pd.DataFrame(columns=['dsl'])
+
+                # Merging all Blocks
+                merged = df_A.copy()
+                for d in [df_B, df_C_merged, df_D_merged, df_E_merged, df_F_merged, df_G_merged, df_H_merged, df_I_merged, df_J_merged]:
+                    if not d.empty: 
+                        overlap_cols = [col for col in d.columns if col in merged.columns and col != 'dsl']
+                        d_clean = d.drop(columns=overlap_cols)
+                        merged = merged.merge(d_clean, on='dsl', how='left')
+                
+                # Fill NAs
+                num_cols_m = merged.select_dtypes(include=[np.number]).columns
+                merged[num_cols_m] = merged[num_cols_m].fillna(0)
+
+                # Ensure required columns for PCs exist
+                required_cols = [
+                    'a11', 'a12', 'fixed_assets_net_closing', 'total_inventory_closing', 'working_capital',
+                    'actual_addition_fixed_assets', 'f9', 'outstanding_loans', 'f10', 'g9', 'g10',
+                    'plant_machinery_gross_closing', 'gross_sale_value_item12', 'gst_item12', 'ex_factory_value_item12',
+                    'excise_vat_other_taxes_item12', 'other_distributive_expenses_item12', 'subsidy_item12', 
+                    'g1', 'g2', 'g3', 'g4', 'g6', 'g7', 'g8', 'g11', 'f7',
+                    'h15', 'h16', 'h17', 'h18', 'h19', 'h20', 'h12', 'h13', 'h14', 'h21', 'imported_total_inputs',
+                    'f1', 'f2a', 'f2b', 'f3', 'f4', 'f6', 'f8', 'f11', 'indigenous_total_inputs',
+                    'depreciation_annexure', 'nfcf_without_f7', 'materials_fuels_stores_closing',
+                    'materials_fuels_stores_opening', 'semi_finished_closing', 'semi_finished_opening',
+                    'finished_goods_closing', 'finished_goods_opening', 'total_employee_wages',
+                    'bonus', 'pf', 'welfare', 'total_workers', 'women_workers', 'costop', 'mult'
+                ]
+                for c in required_cols:
+                    if c not in merged.columns: merged[c] = 0
+
+                # ----------------------------------------------------
+                # APPLY 27 PRINCIPAL CHARACTERISTICS FORMULAS
+                # ----------------------------------------------------
+                merged['pc_01_number_of_factories'] = merged['a11']
+                merged['pc_02_factories_in_operation'] = np.where(merged['a12'].isin([1, 2, 3]), merged['a11'], 0)
+                merged['pc_03_fixed_capital'] = merged['fixed_assets_net_closing']
+                merged['pc_04_physical_working_capital'] = merged['total_inventory_closing']
+                merged['pc_05_working_capital'] = merged['working_capital']
+                merged['pc_06_invested_capital'] = merged['pc_03_fixed_capital'] + merged['pc_04_physical_working_capital']
+                merged['pc_07_gross_value_addition_fixed_capital'] = merged['actual_addition_fixed_assets']
+                merged['pc_08_rent_paid_fixed_assets'] = merged['f9']
+                merged['pc_09_outstanding_loan'] = merged['outstanding_loans']
+                merged['pc_10_interest_paid'] = merged['f10']
+                merged['pc_11_rent_received_fixed_assets'] = merged['g9']
+                merged['pc_12_interest_received'] = merged['g10']
+                merged['pc_13_gross_value_plant_machinery'] = merged['plant_machinery_gross_closing']
+                
+                merged['pc_14_value_product_byproduct'] = merged['gross_sale_value_item12'] - (
+                    merged['gst_item12'] + 
+                    merged['excise_vat_other_taxes_item12'] + 
+                    merged['other_distributive_expenses_item12'] - 
+                    merged['subsidy_item12']
+                )
+                
+                merged['pc_15_total_output'] = (
+                    merged['ex_factory_value_item12'] + merged['g1'] + merged['g2'] + merged['g3'] +
+                    merged['g4'] + merged['g6'] + merged['g7'] + merged['g8'] + merged['g11'] + merged['f7']
+                )
+                merged['pc_16_fuels_consumed'] = (
+                    merged['h15'] + merged['h16'] + merged['h17'] + merged['h18'] + merged['h19'] + merged['h20']
+                )
+                merged['pc_17_materials_consumed'] = (
+                    merged['h12'] + merged['h13'] + merged['h14'] + merged['h21'] + merged['imported_total_inputs']
+                )
+                merged['pc_18_total_inputs'] = (
+                    merged['f1'] + merged['f2a'] + merged['f2b'] + merged['f3'] + merged['f4'] +
+                    merged['f6'] + merged['f7'] + merged['f8'] + merged['f11'] +
+                    merged['indigenous_total_inputs'] + merged['imported_total_inputs']
+                )
+                merged['pc_19_gross_value_added'] = merged['pc_15_total_output'] - merged['pc_18_total_inputs']
+                merged['pc_20_depreciation'] = merged['depreciation_annexure']
+                merged['pc_21_net_value_added'] = merged['pc_19_gross_value_added'] - merged['pc_20_depreciation']
+                merged['pc_22_net_fixed_capital_formation'] = merged['nfcf_without_f7'] + merged['f7']
+                merged['pc_23_gross_fixed_capital_formation'] = merged['pc_22_net_fixed_capital_formation'] + merged['pc_20_depreciation']
+                merged['pc_24a_addition_stock_materials_fuels'] = merged['materials_fuels_stores_closing'] - merged['materials_fuels_stores_opening']
+                merged['pc_24b_addition_stock_semi_finished'] = merged['semi_finished_closing'] - merged['semi_finished_opening']
+                merged['pc_24c_addition_stock_finished_goods'] = merged['finished_goods_closing'] - merged['finished_goods_opening']
+                merged['pc_24_addition_in_stock'] = (
+                    merged['pc_24a_addition_stock_materials_fuels'] + merged['pc_24b_addition_stock_semi_finished'] + merged['pc_24c_addition_stock_finished_goods']
+                )
+                merged['pc_25_gross_capital_formation'] = merged['pc_23_gross_fixed_capital_formation'] + merged['pc_24_addition_in_stock']
+                merged['pc_26_net_income'] = merged['pc_21_net_value_added'] - merged['f9'] - merged['f10']
+                merged['pc_27_net_profit'] = merged['pc_26_net_income'] - merged['total_employee_wages'] - merged['bonus'] - merged['pf'] - merged['welfare']
+
+                # PREVENT PERFORMANCE WARNING: DE-FRAGMENT MEMORY
+                merged = merged.copy()
+
+                # Pre-processing baseline filtering arrays
                 merged["division"] = merged["a5"].astype(str).str[:2] if "a5" in merged.columns else "Unknown"
-                merged["total_emoluments"] = merged["total_wages"].fillna(0) + merged["bonus"].fillna(0) + merged["pf"].fillna(0) + merged["welfare"].fillna(0)
-                
-                for col in merged.select_dtypes(include=[np.number]).columns:
-                    merged[col] = merged[col].fillna(0)
+                merged["total_emoluments"] = merged["total_employee_wages"].fillna(0) + merged["bonus"].fillna(0) + merged["pf"].fillna(0) + merged["welfare"].fillna(0)
                 
                 filter_reasons = []
                 if exclude_zero_mult: merged = merged[merged["mult"] > 0]
@@ -801,18 +1854,18 @@ def run_asi_app():
                 full_df = merged.copy()
                 def pop_estimate(df, col): return (df[col] * df["mult"]).sum() if col in df.columns else 0
                 
-                base_exclude = ["a3", "a9", "mult", "a7", "a5", "a1", "year"]
-                extra_metric_cols = [c for c in full_df.select_dtypes(include=[np.number]).columns if c not in base_exclude and c not in safe_cols]
+                base_exclude = ["a3", "a9", "mult", "a7", "a5", "dsl", "year"]
+                extra_metric_cols = [c for c in full_df.select_dtypes(include=[np.number]).columns if c not in base_exclude]
                 
                 if not sector_df.empty:
                     summary_rows = []
                     for label, curr_df in [(f"Sector: {sector_name}", sector_df), ("All Manufacturing", full_df), ("Other Industrial Baseline", other_df)]:
                         if curr_df.shape[0] == 0: continue
                         w_wk = pop_estimate(curr_df, "total_workers")
-                        w_op = pop_estimate(curr_df, "costop")
+                        w_op = pop_estimate(curr_df, "pc_15_total_output")
                         w_em = pop_estimate(curr_df, "total_emoluments")
                         w_wom = pop_estimate(curr_df, "women_workers")
-                        w_fixed = pop_estimate(curr_df, "fixed_capital")
+                        w_fixed = pop_estimate(curr_df, "pc_03_fixed_capital") 
                         summary_rows.append({
                             "Group Segment": label, "Surveyed Plants": curr_df.shape[0], "Est Population Size": int(round(curr_df["mult"].sum())),
                             "Output per Worker (Lakh)": (w_op / w_wk / 1e5) if w_wk > 0 else 0,
@@ -826,10 +1879,35 @@ def run_asi_app():
                     st.markdown("## 📊 Custom Visualization Studio & Matrix Builder")
                     studio_col1, studio_col2 = st.columns([1, 3])
                     
+                    # ----------------------------------------------------
+                    # UI DROPDOWN LIST ASSEMBLY
+                    # ----------------------------------------------------
+                    base_metrics = [
+                        "Emp per Crore Investment", "Output per Worker (Lakh)", "Labour Income (%)", 
+                        "Women Workforce Share (%)", "Plant Density Count", "Total Segment Workforce"
+                    ]
+                    
+                    pc_options = []
+                    other_options = []
+                    
+                    for c in extra_metric_cols:
+                        if c.startswith('pc_'):
+                            pc_name = ASI_VAR_LABELS.get(c.lower(), c.upper().replace('_', ' '))
+                            pc_options.append(pc_name)
+                        else:
+                            label_key = c.split('_')[-1].lower() if c.startswith(('f_', 'g_', 'h_')) else c.lower()
+                            dict_label = ASI_VAR_LABELS.get(label_key, ASI_VAR_LABELS.get(c.lower(), f"Raw Data: {c.upper()}"))
+                            other_options.append(f"{dict_label} ({c})")
+                            
+                    pc_options.sort()
+                    other_options.sort()
+                    
+                    # PCs -> Base Multi-variable formulas -> Everything else
+                    metric_options = pc_options + base_metrics + other_options
+                    
                     with studio_col1:
                         st.markdown("##### ⚙️ Layout Configuration")
                         chart_dimension = st.selectbox("Data Grouping (Categories):", options=["2-Digit NIC Division", "5-Digit Granular NIC", "Geographical State Location", "Rural vs Urban Region"])
-                        metric_options = ["Emp per Crore Investment", "Output per Worker (Lakh)", "Labour Income (%)", "Women Workforce Share (%)", "Plant Density Count", "Total Segment Workforce"] + [f"Agg: {c}" for c in extra_metric_cols]
                         chart_metric = st.selectbox("Primary Measurement (Y-Axis/Values):", options=metric_options)
                         chart_type = st.selectbox("Visualization Style:", ["Bar Chart", "Line Chart", "Scatter Plot", "Pie Chart"])
                         
@@ -864,10 +1942,10 @@ def run_asi_app():
                         for val_id, grp in full_df.groupby(group_col):
                             if grp.shape[0] < min_sample_threshold: continue
                             w_wk = pop_estimate(grp, "total_workers")
-                            w_op = pop_estimate(grp, "costop")
+                            w_op = pop_estimate(grp, "pc_15_total_output")
                             w_em = pop_estimate(grp, "total_emoluments")
                             w_wom = pop_estimate(grp, "women_workers")
-                            w_fixed = pop_estimate(grp, "fixed_capital")
+                            w_fixed = pop_estimate(grp, "pc_03_fixed_capital")
                             
                             is_tgt = False
                             if chart_dimension == "2-Digit NIC Division" and str(val_id) in [c[:2] for c in nic_codes_list]: is_tgt = True
@@ -881,7 +1959,16 @@ def run_asi_app():
                                 "Women Workforce Share (%)": (w_wom / w_wk * 100) if w_wk > 0 else 0,
                                 "Plant Density Count": grp.shape[0], "Total Segment Workforce": w_wk
                             }
-                            for ext_col in extra_metric_cols: row_data[f"Agg: {ext_col}"] = pop_estimate(grp, ext_col)
+                            
+                            for ext_col in extra_metric_cols:
+                                if ext_col.startswith('pc_'):
+                                    dict_label = ASI_VAR_LABELS.get(ext_col.lower(), ext_col.upper().replace('_', ' '))
+                                else:
+                                    label_key = ext_col.split('_')[-1].lower() if ext_col.startswith(('f_', 'g_', 'h_')) else ext_col.lower()
+                                    dict_label = f"{ASI_VAR_LABELS.get(label_key, ASI_VAR_LABELS.get(ext_col.lower(), 'Raw Data: ' + ext_col.upper()))} ({ext_col})"
+                                
+                                row_data[dict_label] = pop_estimate(grp, ext_col)
+                                
                             studio_rows.append(row_data)
                         
                     studio_plot_df = pd.DataFrame(studio_rows)
@@ -1511,251 +2598,6 @@ def run_plfs_app():
                         st.pyplot(fig2)
                 else: st.warning("⚠️ No records matched your active demographic filter selections.")
 
-def run_comtrade_app():
-    st.title("⚡ Comtrade Sector Pipeline")
-    st.markdown("Select a sector, review the auto-generated configuration, run the pipeline, and explore the results as interactive charts.")
-
-    if "step" not in st.session_state:
-        st.session_state.step = 1
-    if "config_file_path" not in st.session_state:
-        st.session_state.config_file_path = None
-    if "run_timestamp" not in st.session_state:
-        st.session_state.run_timestamp = None
-    if "sector_name" not in st.session_state:
-        st.session_state.sector_name = None
-
-    def reset_app():
-        st.session_state.step = 1
-        st.session_state.config_file_path = None
-        st.session_state.run_timestamp = None
-        st.session_state.sector_name = None
-
-    st.sidebar.button("🔄 Reset Comtrade App", on_click=reset_app)
-
-    if st.session_state.step == 1:
-        st.header("Step 1: Select Sector")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            sector_choice = st.selectbox("Choose a Sector Template", list(SECTOR_PRESETS_COMTRADE.keys()))
-
-            if sector_choice == "Custom / Manual Entry":
-                sector_name = st.text_input("Sector Name", placeholder="e.g., Toys & Games")
-                groups = st.text_input(
-                    "DGCIS QE Groups (Semicolon separated)",
-                    help="Optional. Only fill this in if you want to auto-pull HS codes from an "
-                         "existing DGCIS Major Commodity Group. Leave this BLANK for a fully "
-                         "manual sector."
-                )
-            else:
-                sector_name = sector_choice
-                groups = SECTOR_PRESETS_COMTRADE[sector_choice]
-                st.info(f"**Auto-mapped DGCIS Groups:**\n{groups.replace(';', ' | ')}")
-
-        with col2:
-            hs_level = st.selectbox(
-                "HS Level Default", ["2", "4", "6"], index=0,
-                help="HS chapter granularity used to build the sector_buckets mapping."
-            )
-            hs_filter_text = st.text_input(
-                "HS Chapter Filter (optional, comma-separated 2-digit chapters)",
-                placeholder="e.g., 64",
-                help="Restricts the sector to only these HS chapters."
-            )
-            add_codes_text = st.text_area("Additional Custom HS Codes (comma separated, optional)", placeholder="e.g., 9031,9032")
-            uploaded_hs_file = st.file_uploader("OR Upload CSV/Excel with Custom HS Codes", type=["csv", "xlsx", "xls"])
-
-        if st.button("Generate & Review Configuration", type="primary"):
-            is_manual = (sector_choice == "Custom / Manual Entry" and not groups)
-
-            if not sector_name or (not groups and not is_manual):
-                st.error("Please provide a sector name and at least one QE group.")
-            elif is_manual and not add_codes_text and uploaded_hs_file is None:
-                st.error("Manual entry needs at least one HS code.")
-            else:
-                file_hs_codes = []
-                if uploaded_hs_file is not None:
-                    try:
-                        if uploaded_hs_file.name.endswith('.csv'): df_hs = pd.read_csv(uploaded_hs_file)
-                        else: df_hs = pd.read_excel(uploaded_hs_file)
-                        if not df_hs.empty:
-                            first_col = df_hs.columns[0]
-                            raw_codes = df_hs[first_col].dropna().astype(str).str.replace(r'\.0$', '', regex=True).tolist()
-                            file_hs_codes.extend([c.strip() for c in raw_codes if c.strip()])
-                    except Exception as e:
-                        st.error(f"Could not read uploaded file: {e}")
-                        st.stop()
-
-                combined_codes = []
-                if add_codes_text: combined_codes.extend([c.strip() for c in add_codes_text.split(',') if c.strip()])
-                if file_hs_codes: combined_codes.extend(file_hs_codes)
-
-                final_add_codes_str = ",".join(combined_codes)
-
-                with st.spinner("Compiling sector mapping..."):
-                    script_path = os.path.join(COMTRADE_DIR, "create_sector_config_from_qe.py")
-                    cmd = [sys.executable, script_path, "--sector", sector_name]
-                    if is_manual: cmd.append("--manual")
-                    else: cmd.extend(["--groups" if ";" in groups else "--group", groups])
-                    cmd.extend(["--hs_level", hs_level])
-
-                    if hs_filter_text.strip() and not is_manual: cmd.extend(["--hs_filter", hs_filter_text.strip()])
-                    if final_add_codes_str: cmd.extend(["--add_codes", final_add_codes_str])
-
-                    try:
-                        result = subprocess.run(cmd, capture_output=True, text=True, check=True, env=SUBPROCESS_ENV, encoding="utf-8", errors="replace", cwd=COMTRADE_EXPORTS_DIR)
-                        match = re.search(r"config saved → (.*?\.xlsx)", result.stdout, re.IGNORECASE)
-                        if match:
-                            config_filename = match.group(1).strip()
-                            if not os.path.isabs(config_filename):
-                                st.session_state.config_file_path = os.path.join(COMTRADE_EXPORTS_DIR, config_filename)
-                            else:
-                                st.session_state.config_file_path = config_filename
-                                
-                            st.session_state.sector_name = sector_name
-                            st.session_state.step = 2
-                            st.rerun()
-                        else:
-                            st.error("Could not determine the generated filename. Check logs:")
-                            st.code(result.stdout)
-                    except subprocess.CalledProcessError as e:
-                        st.error("Error generating config:")
-                        error_output = e.stderr if e.stderr and e.stderr.strip() else e.stdout
-                        st.code(error_output if error_output else f"Exit code {e.returncode}.", language="text")
-                    except Exception as e:
-                        st.error(f"An unexpected error occurred: {str(e)}")
-
-    elif st.session_state.step == 2:
-        st.header("Step 2: Review Sector Parameters")
-        st.markdown("We've automatically mapped the HS codes. Review them below and add any custom Buckets if needed.")
-
-        xls = pd.ExcelFile(st.session_state.config_file_path)
-        sheets = {sheet: pd.read_excel(xls, sheet_name=sheet) for sheet in xls.sheet_names}
-
-        tab1, tab2, tab3 = st.tabs(["📝 Details", "🪣 Buckets", "🔢 HS Codes"])
-
-        with tab1: edited_details = st.data_editor(sheets.get("sector_details", pd.DataFrame()), use_container_width=True)
-        with tab2: edited_buckets = st.data_editor(sheets.get("sector_buckets", pd.DataFrame()), num_rows="dynamic", use_container_width=True)
-        with tab3: edited_hs_codes = st.data_editor(sheets.get("hs_codes", pd.DataFrame()), num_rows="dynamic", height=400, use_container_width=True)
-
-        col1, col2 = st.columns([1, 5])
-        with col1:
-            if st.button("← Back"):
-                st.session_state.step = 1
-                st.rerun()
-        with col2:
-            if st.button("Save & Proceed to Run Pipeline", type="primary"):
-                with pd.ExcelWriter(st.session_state.config_file_path, engine="openpyxl") as writer:
-                    edited_details.to_excel(writer, sheet_name="sector_details", index=False)
-                    edited_buckets.to_excel(writer, sheet_name="sector_buckets", index=False)
-                    edited_hs_codes.to_excel(writer, sheet_name="hs_codes", index=False)
-                    for sheet in sheets:
-                        if sheet not in ["sector_details", "sector_buckets", "hs_codes"]:
-                            sheets[sheet].to_excel(writer, sheet_name=sheet, index=False)
-
-                st.session_state.step = 3
-                st.rerun()
-
-    elif st.session_state.step == 3:
-        st.header("Step 3: Execute & Explore")
-
-        _default_key = ""
-        _secrets_paths = [Path.home() / ".streamlit" / "secrets.toml", Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"]
-        if any(p.exists() for p in _secrets_paths):
-            try: _default_key = st.secrets.get("COMTRADE_API_KEY", "")
-            except Exception: pass
-        if not _default_key: _default_key = os.environ.get("COMTRADE_API_KEY", "")
-
-        api_key = st.text_input("UN Comtrade API Key", value=_default_key, type="password")
-
-        pipeline_modes_map = {
-            "🚀 Full Auto-Sequence (Download → Clean → Competitor → Visuals → Summary)": ["full", "clean", "competitor_full", "visuals_data", "slide_ready"],
-            "Setup Check Only": ["setup_check"],
-            "Test Sample Only (1 HS code, 1 year)": ["test"],
-            "Full Data Download Only": ["full"],
-            "Cleaned Excel Workbook (incl. Competitor Analysis)": ["clean", "competitor_full"],
-            "Generate Visuals Only": ["visuals_data"],
-            "Generate Summary Tables Only": ["slide_ready"],
-        }
-
-        col1, col2 = st.columns(2)
-        with col1:
-            selected_label = st.selectbox("Select Output Type", list(pipeline_modes_map.keys()), index=0)
-            modes_to_run = pipeline_modes_map[selected_label]
-            st.caption("Pipeline modes that will run: " + " → ".join(f"`{m}`" for m in modes_to_run))
-
-        if st.button("🚀 Run Pipeline", type="primary"):
-            requires_api = any(m in ["test", "full"] for m in modes_to_run)
-
-            if not api_key and requires_api:
-                st.error("API Key is required to fetch data for the selected mode(s).")
-            else:
-                if api_key: os.environ["COMTRADE_API_KEY"] = api_key
-
-                st.session_state.run_timestamp = time.time()
-                log_container = st.empty()
-                log_text = ""
-                total_steps = len(modes_to_run)
-                progress_bar = st.progress(0) if total_steps > 1 else None
-                pipeline_failed = False
-
-                for idx, current_mode in enumerate(modes_to_run):
-                    step_indicator = f"Step {idx + 1}/{total_steps}: Running `{current_mode}`" if total_steps > 1 else f"Running `{current_mode}`"
-                    with st.spinner(f"{step_indicator}... Please wait."):
-                        script_path = os.path.join(COMTRADE_DIR, "sector_comtrade_pipeline.py")
-                        cmd = [sys.executable, script_path, "--config", st.session_state.config_file_path, "--mode", current_mode]
-                        try:
-                            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=SUBPROCESS_ENV, encoding="utf-8", errors="replace", cwd=COMTRADE_EXPORTS_DIR)
-                            for line in iter(process.stdout.readline, ''):
-                                log_text += line
-                                log_container.code(log_text[-2000:], language="text")
-                            process.wait()
-                            if process.returncode != 0:
-                                st.error(f"❌ Pipeline encountered an error during `{current_mode}`. Check logs above.")
-                                pipeline_failed = True
-                                break 
-                        except Exception as e:
-                            st.error(f"An unexpected error occurred: {e}")
-                            pipeline_failed = True
-                            break
-
-                    if progress_bar: progress_bar.progress((idx + 1) / total_steps)
-
-                if not pipeline_failed:
-                    st.success("✅ Pipeline execution complete!")
-                    if any(m in ("clean", "competitor_full", "competitor_test") for m in modes_to_run):
-                        cleaned_check = locate_cleaned_workbook(st.session_state.config_file_path)
-                        st.markdown("**Cleaned workbook diagnostics:**")
-                        for level, msg in diagnose_cleaned_workbook(cleaned_check):
-                            {"error": st.error, "warning": st.warning, "success": st.success}[level](msg)
-
-        chart_data_path = locate_chart_data_workbook(st.session_state.config_file_path)
-        if chart_data_path:
-            st.divider()
-            show_interactive_visuals(chart_data_path, st.session_state.sector_name or "Sector")
-
-        cleaned_path_for_explore = locate_cleaned_workbook(st.session_state.config_file_path)
-        if cleaned_path_for_explore:
-            st.divider()
-            render_master_table_explorer(cleaned_path_for_explore, st.session_state.sector_name or "Sector")
-
-        if st.session_state.run_timestamp:
-            st.divider()
-            st.subheader("📥 Download Outputs")
-            output_files_found = False
-
-            for filename in os.listdir(COMTRADE_EXPORTS_DIR):
-                if filename.endswith((".xlsx", ".csv", ".log")):
-                    filepath = os.path.join(COMTRADE_EXPORTS_DIR, filename)
-                    if os.path.getmtime(filepath) >= st.session_state.run_timestamp:
-                        if filepath != st.session_state.config_file_path:
-                            output_files_found = True
-                            with open(filepath, "rb") as file_data:
-                                file_bytes = file_data.read()
-                                st.download_button(label=f"Download 📊 {filename}", data=file_bytes, file_name=filename, mime="application/octet-stream")
-
-            if not output_files_found:
-                st.info("No new output files generated yet.")
 # ==============================================================================
 # 3. MASTER NAVIGATION & EXECUTION PIPELINE
 # ==============================================================================
