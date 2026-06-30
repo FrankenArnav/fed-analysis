@@ -43,12 +43,54 @@ st.set_page_config(page_title="Unified Data Hub", layout="wide")
 
 # --- ASI CONSTANTS ---
 ASI_NIC_NAMES = {
+    # Manufacturing (Section C) — the core divisions ASI is built around
     "10": "Food Products",        "11": "Beverages",            "12": "Tobacco",              "13": "Textiles",
     "14": "Wearing Apparel",      "15": "Leather & Footwear",   "16": "Wood Products",        "17": "Paper",
     "18": "Printing",             "19": "Petroleum/Coke",       "20": "Chemicals",            "21": "Pharmaceuticals",
     "22": "Rubber & Plastics",    "23": "Non-metallic Minerals","24": "Basic Metals",         "25": "Fabricated Metals",
     "26": "Electronics",          "27": "Electrical Equipment", "28": "Machinery",            "29": "Automobiles & Auto",
     "30": "Other Transport",      "31": "Furniture",            "32": "Other Manufacturing",  "33": "Repair & Installation",
+    # Every other NIC-2008 (ISIC Rev.4-aligned) 2-digit division — these show
+    # up occasionally in the raw data (e.g. electricity/water-supply factories,
+    # or miscoded records) and previously fell back to a bare "Code ID XX".
+    "01": "Crop & Animal Production",      "02": "Forestry & Logging",
+    "03": "Fishing & Aquaculture",         "05": "Coal & Lignite Mining",
+    "06": "Crude Petroleum & Gas",         "07": "Metal Ore Mining",
+    "08": "Other Mining & Quarrying",      "09": "Mining Support Services",
+    "35": "Electricity, Gas & Steam Supply",
+    "36": "Water Collection & Supply",     "37": "Sewerage",
+    "38": "Waste Collection & Disposal",   "39": "Remediation & Waste Mgmt Services",
+    "41": "Construction of Buildings",     "42": "Civil Engineering",
+    "43": "Specialized Construction",
+    "45": "Motor Vehicle Trade & Repair",  "46": "Wholesale Trade",
+    "47": "Retail Trade",
+    "49": "Land Transport",                "50": "Water Transport",
+    "51": "Air Transport",                 "52": "Warehousing & Support Services",
+    "53": "Postal & Courier Activities",
+    "55": "Accommodation",                 "56": "Food & Beverage Services",
+    "58": "Publishing Activities",         "59": "Motion Picture & Music Production",
+    "60": "Programming & Broadcasting",    "61": "Telecommunications",
+    "62": "Computer Programming & Consultancy", "63": "Information Service Activities",
+    "64": "Financial Services",            "65": "Insurance & Pension Funding",
+    "66": "Auxiliary Financial Services",
+    "68": "Real Estate Activities",
+    "69": "Legal & Accounting Activities", "70": "Head Offices & Management Consultancy",
+    "71": "Architecture & Engineering",    "72": "Scientific R&D",
+    "73": "Advertising & Market Research", "74": "Other Professional & Technical Activities",
+    "75": "Veterinary Activities",
+    "77": "Rental & Leasing Activities",   "78": "Employment Activities",
+    "79": "Travel Agency & Tour Operator", "80": "Security & Investigation Activities",
+    "81": "Building & Landscape Services", "82": "Office Admin & Business Support",
+    "84": "Public Administration & Defence",
+    "85": "Education",
+    "86": "Human Health Activities",       "87": "Residential Care Activities",
+    "88": "Social Work Activities",
+    "90": "Creative, Arts & Entertainment","91": "Libraries, Archives & Museums",
+    "92": "Gambling & Betting Activities", "93": "Sports & Recreation Activities",
+    "94": "Membership Organizations",      "95": "Repair of Computers & Household Goods",
+    "96": "Other Personal Service Activities",
+    "97": "Households as Employers",       "98": "Undifferentiated Household Production",
+    "99": "Extraterritorial Organizations & Bodies",
 }
 
 ASI_STATE_NAMES = {
@@ -2010,7 +2052,7 @@ def run_asi_app():
                                     label_offset = max_height * 0.02
                                 else:
                                     label_offset = 0
-                                for bar in bars[:5]:
+                                for bar in bars:
                                     height = bar.get_height()
                                     ax.text(bar.get_x() + bar.get_width() / 2., height + label_offset,
                                             _fmt_compact(height), ha='center', va='bottom', fontsize=8)
